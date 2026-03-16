@@ -1,5 +1,3 @@
-"""Forecast script for the model."""
-
 import sys
 from datetime import datetime
 import logging
@@ -58,6 +56,11 @@ def main():
     num_features = num_atm_features + num_sur_features
     num_forecast_steps = cfg.model.forecast_steps
 
+    # Ensemble configuration — mirrors LitParadis setup
+    noise_channels  = cfg.model.get("noise_channels", 0)
+    ensemble_mode   = noise_channels > 0
+    num_members     = cfg.training.get("num_ensemble_members", 4) if ensemble_mode else 1
+
     # Get the output number of forecast steps based on the output frequency
     output_frequency = cfg.forecast.output_frequency
     output_num_forecast_steps = max(1, num_forecast_steps // output_frequency)
@@ -95,6 +98,8 @@ def main():
     init_times = dataset.time
 
     logging.info(f"Number of forecasts to generate: {len(init_times)}")
+    if ensemble_mode:
+        logging.info(f"Ensemble mode: {num_members} members")
 
     # Run forecast
     logging.info("Generating forecast...")
@@ -107,50 +112,94 @@ def main():
 
             batch_size = input_data.shape[0]
 
-            output_forecast = torch.empty(
-                (
-                    batch_size,
-                    output_num_forecast_steps,
-                    num_features,
-                    dataset.lat_size,
-                    dataset.lon_size,
-                ),
-                device=device,
-            )
-
-            frequency_counter = 0
-
-            for step in range(num_forecast_steps):
-                output_data = litmodel(
-                    input_data[:, step].to(device),
+            if ensemble_mode:
+                output_forecast = torch.empty(
+                    (
+                        batch_size,
+                        num_members,
+                        output_num_forecast_steps,
+                        num_features,
+                        dataset.lat_size,
+                        dataset.lon_size,
+                    ),
+                    device=device,
                 )
 
-                input_data = litmodel._autoregression_input_from_output(
-                    input_data, output_data, step, num_forecast_steps
+                # Each member maintains its own independent autoregressive state
+                member_inputs = [input_data.clone() for _ in range(num_members)]
+
+                for m in range(num_members):
+                    frequency_counter = 0
+                    for step in range(num_forecast_steps):
+                        # model.forward() auto-samples per-grid-point noise when
+                        # noise_emb is not provided — each member call gets fresh noise
+                        output_data = litmodel(
+                            member_inputs[m][:, step].to(device),
+                        )
+
+                        member_inputs[m] = litmodel._autoregression_input_from_output(
+                            member_inputs[m], output_data, step, num_forecast_steps
+                        )
+
+                        if step % cfg.forecast.output_frequency == 0:
+                            output_forecast[:, m, frequency_counter] = output_data
+                            frequency_counter += 1
+
+                # Transfer to CPU: (B, M, output_steps, F, lat, lon)
+                output_forecast = output_forecast.cpu()
+
+                # Denormalize each member independently
+                for m in range(num_members):
+                    denormalize_datasets(ground_truth, output_forecast[:, m], dataset)
+
+                # Post-process winds for each member
+                for m in range(num_members):
+                    convert_cartesian_to_spherical_winds(
+                        dataset.lat, dataset.lon, cfg, ground_truth, output_features
+                    )
+                    convert_cartesian_to_spherical_winds(
+                        dataset.lat, dataset.lon, cfg, output_forecast[:, m].numpy(), output_features
+                    )
+
+                output_forecast = output_forecast.numpy()
+
+            else:
+                # Deterministic forecast
+                output_forecast = torch.empty(
+                    (
+                        batch_size,
+                        output_num_forecast_steps,
+                        num_features,
+                        dataset.lat_size,
+                        dataset.lon_size,
+                    ),
+                    device=device,
                 )
 
-                # Store only at required frequency
-                if step % cfg.forecast.output_frequency == 0:
-                    output_forecast[:, frequency_counter] = output_data
-                    frequency_counter += 1
+                frequency_counter = 0
+                for step in range(num_forecast_steps):
+                    output_data = litmodel(
+                        input_data[:, step].to(device),
+                    )
 
-            # Transfer output to cpu
-            output_forecast = output_forecast.cpu()
+                    input_data = litmodel._autoregression_input_from_output(
+                        input_data, output_data, step, num_forecast_steps
+                    )
 
-            # Remove normalizations
-            denormalize_datasets(ground_truth, output_forecast, dataset)
+                    if step % cfg.forecast.output_frequency == 0:
+                        output_forecast[:, frequency_counter] = output_data
+                        frequency_counter += 1
 
-            # Convert from pytorch tensor to numpy array
-            output_forecast = output_forecast.numpy()
+                output_forecast = output_forecast.cpu()
+                denormalize_datasets(ground_truth, output_forecast, dataset)
+                output_forecast = output_forecast.numpy()
 
-            # Post-process cartesian winds to spherical
-            convert_cartesian_to_spherical_winds(
-                dataset.lat, dataset.lon, cfg, ground_truth, output_features
-            )
-
-            convert_cartesian_to_spherical_winds(
-                dataset.lat, dataset.lon, cfg, output_forecast, output_features
-            )
+                convert_cartesian_to_spherical_winds(
+                    dataset.lat, dataset.lon, cfg, ground_truth, output_features
+                )
+                convert_cartesian_to_spherical_winds(
+                    dataset.lat, dataset.lon, cfg, output_forecast, output_features
+                )
 
             # Save results
             if cfg.forecast.output_file is not None:
@@ -165,6 +214,7 @@ def main():
                     cfg.forecast.output_file,
                     ind,
                     init_times[time_start_ind : time_start_ind + batch_size],
+                    ensemble_mode=ensemble_mode,
                 )
 
             ind += 1

@@ -12,6 +12,7 @@ model:
   adv_interpolation: bicubic       # Choose between bilinear or bicubic
   projected_advection: true        # Whether to project the advection layers to velocity_vectors space
   num_encoder_layers: 1            # Number of input encoding layers
+  noise_channels: 4                # number of raw noise channels. Set to 0 to disable ensemble mode entirely
 
 # Initialization settings (seeding)
 init:
@@ -33,7 +34,7 @@ normalization:
 # Compute/hardware aspects
 compute:
   num_nodes: 1                     # Number of nodes
-  num_devices: 1                   # Number of GPUS/CPU devices per node
+  num_devices: 4                   # Number of GPUS/CPU devices per node
   accelerator: gpu                 # CPU/GPU
   use_amp: true                    # Enable AMP (Automatic Mixed Precision)
   batch_size: 32                   # Number of samples per batch
@@ -58,6 +59,8 @@ training:
   log_every_n_steps: 100           # Write to log every n steps
   log_dir: logs
   experiment_name: null            # Optional: Custom name for log directory (replaces version_xxx), set to null for default versioning
+  num_ensemble_members: 2          # how many members per batch during training
+  crps_alpha: 0.95                 # almost-fair CRPS blend factor. 1.0 = fair CRPS
 
   dataset:
     start_date: 1990-01-01         # Start date for the training dataset (YYYY-MM-DD)

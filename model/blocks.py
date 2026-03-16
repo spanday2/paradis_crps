@@ -8,26 +8,6 @@ from torch import nn
 
 from model.padding import GeoCyclicPadding
 
-"""
-    simple_blocks: Wrapper file to consolidate simple NN layers, defined as those that do
-    not have activation functions.  This includes convolution, normalization, and bias layers.
-
-    These modules are specialized to expect Tensors of shape (batch,channels,lat,lon).
-
-    For consistency, all of these modules are defined to take the following parameters:
-        * input_dim -- number of input channels (required)
-        * output_dim -- number of output channels (required)
-        * kernel_size -- width of the convolution kernel (default: varies by class)
-        * bias -- whether to add a bias term (default: True)
-        * mesh_size -- (lat, lon) tuple of 2D mesh size (required for some classes)
-        * **kwargs -- additional parameters are accepted and ignored
-
-    Not all parameters are relevant to each module. Each class explicitly defines only
-    the parameters it uses, and accepts **kwargs for the rest. Unused parameters are
-    silently ignored. Some modules impose stricter requirements and will assert/check
-    parameter values (e.g., FlatConv requires input_dim == output_dim).
-"""
-
 
 class CLinear(nn.Module):
     """Channel-wise linear transformation."""
@@ -93,6 +73,57 @@ class ChannelNorm(nn.Module):
         return x
 
 
+class ConditionalChannelNorm(nn.Module):
+    """Conditional channel normalization driven by a per-grid-point noise embedding.
+
+    Replaces ChannelNorm in GMBlocks that have pre_normalize=True when the
+    model is run in ensemble mode. The noise embedding modulates the per-channel
+    scale and bias after standard normalisation.
+
+    Args:
+        input_dim:   Number of channels (must equal output_dim, same as ChannelNorm above).
+        noise_dim:   Dimensionality of the noise embedding (channel count of the
+                     spatial noise field).
+    """
+
+    def __init__(self, input_dim: int, noise_dim: int):
+        super().__init__()
+        assert input_dim > 0 and noise_dim > 0
+        self.eps = 1e-5
+        # Base learnable affine parameters (same as ChannelNorm)
+        self.weight = nn.Parameter(torch.ones(input_dim), requires_grad=True)
+        self.bias = nn.Parameter(torch.zeros(input_dim), requires_grad=True)
+        # Initialised so that at noise_emb=0 the output equals plain ChannelNorm.
+        self.noise_scale = nn.Conv2d(noise_dim, input_dim, kernel_size=1)
+        self.noise_bias  = nn.Conv2d(noise_dim, input_dim, kernel_size=1)
+        nn.init.zeros_(self.noise_scale.weight)
+        nn.init.ones_(self.noise_scale.bias)   # scale correction starts at 1
+        nn.init.zeros_(self.noise_bias.weight)
+        nn.init.zeros_(self.noise_bias.bias)
+
+    def forward(self, x: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:         (B, C, lat, lon)
+            noise_emb: (B, noise_dim, lat, lon)  — per-grid-point noise embedding
+        Returns:
+            (B, C, lat, lon) conditionally normalised tensor
+        """
+        # Standard channel normalisation
+        cvar, cmean = torch.var_mean(x, dim=-3, keepdim=False)
+        inv_std = (self.eps + cvar) ** -0.5
+        shifted_x = x - cmean[..., None, :, :]
+        x_norm = torch.einsum(
+            "...cij,...ij,c->...cij", shifted_x, inv_std, self.weight
+        )
+        x_norm = x_norm + self.bias[..., :, None, None]
+
+        # Per-grid-point affine modulation — both scale and bias are (B, C, lat, lon)
+        scale = self.noise_scale(noise_emb)   # (B, C, lat, lon)
+        bias  = self.noise_bias(noise_emb)    # (B, C, lat, lon)
+        return x_norm * scale + bias
+
+
 class GlobalBias(nn.Module):
     """Learned bias operator with geophysical features."""
 
@@ -134,10 +165,12 @@ BLOCK_REGISTRY = {
 }
 
 
-class GMBlock(nn.Sequential):
-    """
-    Generic Multilayer Block.
-    Composes several simple blocks with activation functions.
+class GMBlock(nn.Module):
+    """Generic Multilayer Block.
+
+    When noise_dim > 0 the pre_normalize ChannelNorm is replaced with a
+    ConditionalChannelNorm that accepts a noise_emb argument in forward().
+    All other behaviour is identical to the original nn.Sequential version.
     """
 
     def __init__(
@@ -152,7 +185,10 @@ class GMBlock(nn.Sequential):
         bias_channels: int = 0,
         activation: Union[Sequence, bool] = False,
         pre_normalize: bool = False,
+        noise_dim: int = 0,          # NEW: 0 = deterministic (original behaviour)
     ):
+        super().__init__()
+
         num_layers = len(layers)
         if num_layers == 0:
             raise ValueError("GMBlock: must specify at least one layer")
@@ -169,32 +205,34 @@ class GMBlock(nn.Sequential):
                 hidden_dim = max(input_dim, output_dim)
             hidden_dim = (hidden_dim,) * (num_layers - 1)
 
-        blocks = []
+        # Track whether we use conditional normalisation
+        self.use_cond_norm = pre_normalize and noise_dim > 0
+        self.pre_normalize  = pre_normalize
+        self.cond_norm: nn.Module | None = None
 
         if pre_normalize:
-            blocks.append(
-                (
-                    "0-ChannelNorm",
-                    ChannelNorm(input_dim=input_dim, output_dim=input_dim),
-                )
-            )
+            if self.use_cond_norm:
+                # Replaces ChannelNorm — called manually in forward()
+                self.cond_norm = ConditionalChannelNorm(input_dim, noise_dim)
+            else:
+                self.plain_norm = ChannelNorm(input_dim=input_dim, output_dim=input_dim)
 
+        # Build the remaining (non-norm) layers as a plain Sequential
+        blocks = []
         layer_in_size = input_dim
 
         for idx, l in enumerate(layers):
             if isinstance(l, str):
                 if l not in BLOCK_REGISTRY:
                     raise ValueError(
-                        f"Unknown layer type: {l}. Available: {list(BLOCK_REGISTRY.keys())}"
+                        f"Unknown layer type: {l}. "
+                        f"Available: {list(BLOCK_REGISTRY.keys())}"
                     )
                 ltype = BLOCK_REGISTRY[l]
             else:
                 ltype = l
 
-            if idx == num_layers - 1:
-                layer_out_size = output_dim
-            else:
-                layer_out_size = hidden_dim[idx]
+            layer_out_size = output_dim if idx == num_layers - 1 else hidden_dim[idx]
 
             layer_name = f"{idx}-{ltype.__name__}"
             layer_obj = ltype(
@@ -206,20 +244,37 @@ class GMBlock(nn.Sequential):
             blocks.append((layer_name, layer_obj))
 
             if idx == 0 and bias_channels > 0:
-                blocks.append(
-                    (
-                        f"0-GlobalBias",
-                        GlobalBias(
-                            input_dim=bias_channels,
-                            output_dim=layer_out_size,
-                            mesh_size=mesh_size,
-                        ),
-                    )
-                )
+                blocks.append((
+                    "0-GlobalBias",
+                    GlobalBias(
+                        input_dim=bias_channels,
+                        output_dim=layer_out_size,
+                        mesh_size=mesh_size,
+                    ),
+                ))
 
             if activation[idx]:
                 blocks.append((f"{idx}-{activation_fn.__name__}", activation_fn()))
 
             layer_in_size = layer_out_size
 
-        super().__init__(OrderedDict(blocks))
+        self.body = nn.Sequential(OrderedDict(blocks))
+
+    def forward(self, x: torch.Tensor, noise_emb: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            x:         (B, C, lat, lon)
+            noise_emb: (B, noise_dim, lat, lon) or None.
+                       Required when the block was built with noise_dim > 0.
+        """
+        if self.pre_normalize:
+            if self.use_cond_norm:
+                if noise_emb is None:
+                    raise ValueError(
+                        "GMBlock built with noise_dim > 0 requires noise_emb in forward()"
+                    )
+                x = self.cond_norm(x, noise_emb)
+            else:
+                x = self.plain_norm(x)
+
+        return self.body(x)

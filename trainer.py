@@ -224,9 +224,9 @@ class LitParadis(L.LightningModule):
             checkpoint = torch.load(
                 cfg.init.checkpoint_path, weights_only=True, map_location="cpu"
             )
-            self.load_state_dict(checkpoint, strict=False)
-
-        self.epoch_start_time = None
+            state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint      
+            self.load_state_dict(state_dict, strict=True)
+            
 
         if not cfg.forecast.enable and cfg.training.reports.enable:
             self.report_features = cfg.training.reports.features

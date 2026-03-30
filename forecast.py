@@ -146,22 +146,30 @@ def main():
                             frequency_counter += 1
 
                 # Transfer to CPU: (B, M, output_steps, F, lat, lon)
+                # output_forecast = output_forecast.cpu()
                 output_forecast = output_forecast.cpu()
 
                 # Denormalize each member independently
                 for m in range(num_members):
                     denormalize_datasets(ground_truth, output_forecast[:, m], dataset)
 
+                output_forecast = output_forecast.numpy().astype(numpy.float64)
+                ground_truth_np = ground_truth.numpy().astype(numpy.float64)
                 # Post-process winds for each member
                 for m in range(num_members):
                     convert_cartesian_to_spherical_winds(
-                        dataset.lat, dataset.lon, cfg, ground_truth, output_features
+                        dataset.lat, dataset.lon, cfg, ground_truth_np, output_features
                     )
+                    # convert_cartesian_to_spherical_winds(
+                    #     dataset.lat, dataset.lon, cfg, output_forecast[:, m].numpy(), output_features
+                    # )
                     convert_cartesian_to_spherical_winds(
-                        dataset.lat, dataset.lon, cfg, output_forecast[:, m].numpy(), output_features
+                        dataset.lat, dataset.lon, cfg,
+                        numpy.ascontiguousarray(output_forecast[:, m]),
+                        output_features
                     )
 
-                output_forecast = output_forecast.numpy()
+                # output_forecast = output_forecast.numpy()
 
             else:
                 # Deterministic forecast

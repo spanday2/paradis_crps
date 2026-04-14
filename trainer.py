@@ -34,19 +34,7 @@ def _allreduce_scalar(x: torch.Tensor, op: str):
 
 
 class AlmostFairCRPS(nn.Module):
-    """Almost-fair CRPS loss (Eq. 4, AIFS-CRPS paper).
-
-    afCRPS_α = (1 / 2M(M-1)) * Σ_{j≠k} (|x_j - y| + |x_k - y| - (1-ε)|x_j - x_k|)
-
-    where ε = (1-α)/M.  The double-sum form guarantees every term is non-negative
-    (triangle inequality), avoiding numerical issues under reduced precision.
-
-    Args:
-        alpha:       Blend factor; α=1 → fair CRPS, α<1 → avoids degeneracy.
-                     Paper uses α=0.95.
-        lat_weights: Optional 1-D tensor of shape (nlat,) for latitude weighting.
-                     If supplied the loss is a weighted mean over grid points.
-    """
+    """Almost-fair CRPS loss"""
 
     def __init__(self, alpha: float = 0.95, lat_weights: torch.Tensor | None = None):
         super().__init__()
@@ -56,40 +44,44 @@ class AlmostFairCRPS(nn.Module):
         else:
             self.lat_weights = None
 
-    def forward(
+    def decompose(
         self,
-        members: torch.Tensor,   # (B, M, F)  — ensemble members
-        target:  torch.Tensor,   # (B, F)     — deterministic analysis
-    ) -> torch.Tensor:
+        members: torch.Tensor,   # (B, M, F)
+        target: torch.Tensor,    # (B, F)
+    ):
         B, M, F = members.shape
         eps = (1.0 - self.alpha) / M
 
-        # Expand target: (B, 1, F)
-        y = target.unsqueeze(1)
+        y = target.unsqueeze(1)                      # (B, 1, F)
+        abs_xy = torch.abs(members - y)             # (B, M, F)
+        diff = members.unsqueeze(2) - members.unsqueeze(1)   # (B, M, M, F)
+        abs_xx = torch.abs(diff)                    # (B, M, M, F)
 
-        # |x_j - y|: (B, M, F)
-        abs_xy = torch.abs(members - y)
+        sum_abs_xy = abs_xy.sum(dim=1)              # (B, F)
+        sum_abs_xx = abs_xx.sum(dim=(1, 2))         # (B, F)
 
-        # Pairwise |x_j - x_k|: (B, M, M, F)
-        diff = members.unsqueeze(2) - members.unsqueeze(1)  # (B, M, M, F)
-        abs_xx = torch.abs(diff)
+        # Positive fit term
+        fit_per_feature = sum_abs_xy / M
 
-        # Eq. 4: sum over j≠k of (|x_j-y| + |x_k-y| - (1-ε)|x_j-x_k|)
-        # Expanding the j≠k sum:
-        #   Σ_{j≠k} |x_j-y| = (M-1) * Σ_j |x_j-y|   (each row appears M-1 times)
-        #   Σ_{j≠k} |x_j-x_k| = full pairwise sum minus diagonal (which is 0)
-        sum_abs_xy = abs_xy.sum(dim=1)          # (B, F)
-        sum_abs_xx = abs_xx.sum(dim=(1, 2))     # (B, F)  diagonal is 0 so no masking needed
+        # Positive spread correction magnitude
+        spread_per_feature = ((1.0 - eps) * sum_abs_xx) / (2 * M * (M - 1))
 
-        numerator = (M - 1) * 2 * sum_abs_xy - (1.0 - eps) * sum_abs_xx
-        loss_per_feature = numerator / (2 * M * (M - 1))  # (B, F)
+        # afCRPS = fit - spread
+        loss_per_feature = fit_per_feature - spread_per_feature
 
-        # Average over batch
-        loss = loss_per_feature.mean(dim=0)    # (F,)
+        fit = fit_per_feature.mean()
+        spread = spread_per_feature.mean()
+        loss = loss_per_feature.mean()
 
-        # Optional latitude weighting — assumes F = (nlev * natm + nsfc)
-        # and lat_weights shape is handled outside if needed; here we just mean.
-        return loss.mean()
+        return loss, fit, spread
+
+    def forward(
+        self,
+        members: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        loss, _, _ = self.decompose(members, target)
+        return loss
 
 
 
@@ -305,6 +297,8 @@ class LitParadis(L.LightningModule):
         batch_size = input_data.size(0)
         num_steps  = input_data.size(1)
         train_loss = 0.0
+        train_fit = 0.0
+        train_spread = 0.0
 
         if self.ensemble_mode:
             member_inputs = [input_data.clone() for _ in range(self.num_members)]
@@ -328,7 +322,10 @@ class LitParadis(L.LightningModule):
                     [o.reshape(B, -1) for o in member_outputs], dim=1
                 )                                   
                 target_flat = true_data[:, step].reshape(B, -1)
-                train_loss += self.crps_loss(members_flat, target_flat)
+                loss_step, fit_step, spread_step = self.crps_loss.decompose(members_flat, target_flat)
+                train_loss += loss_step
+                train_fit += fit_step
+                train_spread += spread_step
 
         else:
             # Deterministic forward — original behaviour
@@ -340,9 +337,15 @@ class LitParadis(L.LightningModule):
                 )
 
         batch_loss = train_loss / num_steps
+        batch_fit = train_fit / num_steps if self.ensemble_mode else torch.tensor(0.0, device=self.device)
+        batch_spread = train_spread / num_steps if self.ensemble_mode else torch.tensor(0.0, device=self.device)
         self._last_train_loss_value = float(batch_loss.detach().item())
 
         self.log("train_loss",     batch_loss, on_step=True,  on_epoch=False, prog_bar=True,  sync_dist=True)
+        if self.ensemble_mode:
+            self.log("train_crps_fit", batch_fit, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            self.log("train_crps_spread", batch_spread, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            
         self.log("lr",             self.trainer.optimizers[0].param_groups[0]["lr"], prog_bar=True)
         self.log("forecast_steps", num_steps,  on_step=True,  on_epoch=False, prog_bar=True,  sync_dist=True)
         return batch_loss
@@ -353,6 +356,8 @@ class LitParadis(L.LightningModule):
         num_steps  = input_data.size(1)
 
         val_loss    = 0.0
+        val_fit = 0.0
+        val_spread = 0.0
         report_loss = 0.0
 
         if self.ensemble_mode:
@@ -374,7 +379,10 @@ class LitParadis(L.LightningModule):
                     [o.reshape(B, -1) for o in member_outputs], dim=1
                 )
                 target_flat = true_data[:, step].reshape(B, -1)
-                val_loss += self.crps_loss(members_flat, target_flat)
+                loss_step, fit_step, spread_step = self.crps_loss.decompose(members_flat, target_flat)
+                val_loss += loss_step
+                val_fit += fit_step
+                val_spread += spread_step
 
                 # RMSE report uses ensemble mean as a point estimate
                 mean_out = torch.stack(member_outputs, dim=0).mean(dim=0)
@@ -390,6 +398,10 @@ class LitParadis(L.LightningModule):
                 )
 
         self.log("val_loss", val_loss / num_steps, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        if self.ensemble_mode:
+            self.log("val_crps_fit", val_fit / num_steps, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("val_crps_spread", val_spread / num_steps, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         for i, name in enumerate(self.cfg.training.reports.features):
             self.log(name, report_loss[i] / num_steps, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)

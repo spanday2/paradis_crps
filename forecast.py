@@ -136,7 +136,21 @@ def main():
                         output_data = litmodel(
                             member_inputs[m][:, step].to(device),
                         )
-
+                        
+                        # zero_noise_emb = torch.zeros(
+                        #     batch_size,
+                        #     litmodel.model.hidden_dim,
+                        #     litmodel.nlat,
+                        #     litmodel.nlon,
+                        #     device=device,
+                        #     dtype=member_inputs[m].dtype,
+                        # )
+                        
+                        # output_data = litmodel(
+                        #     member_inputs[m][:, step].to(device),
+                        #     noise_emb=zero_noise_emb, 
+                        # )
+                        
                         member_inputs[m] = litmodel._autoregression_input_from_output(
                             member_inputs[m], output_data, step, num_forecast_steps
                         )

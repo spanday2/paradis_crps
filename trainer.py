@@ -34,11 +34,17 @@ def _allreduce_scalar(x: torch.Tensor, op: str):
 
 
 class AlmostFairCRPS(nn.Module):
-    """Almost-fair CRPS loss"""
+    """Almost-fair CRPS loss with chunked feature processing."""
 
-    def __init__(self, alpha: float = 0.95, lat_weights: torch.Tensor | None = None):
+    def __init__(
+        self,
+        alpha: float = 0.95,
+        lat_weights: torch.Tensor | None = None,
+        chunk_size: int = 200000,
+    ):
         super().__init__()
         self.alpha = alpha
+        self.chunk_size = chunk_size
         if lat_weights is not None:
             self.register_buffer("lat_weights", lat_weights)
         else:
@@ -52,34 +58,45 @@ class AlmostFairCRPS(nn.Module):
         B, M, F = members.shape
         eps = (1.0 - self.alpha) / M
 
-        y = target.unsqueeze(1)                      # (B, 1, F)
-        abs_xy = torch.abs(members - y)             # (B, M, F)
-        diff = members.unsqueeze(2) - members.unsqueeze(1)   # (B, M, M, F)
-        abs_xx = torch.abs(diff)                    # (B, M, M, F)
+        fit_sum = members.new_zeros(())
+        spread_sum = members.new_zeros(())
+        loss_sum = members.new_zeros(())
+        counted_features = 0
 
-        sum_abs_xy = abs_xy.sum(dim=1)              # (B, F)
-        sum_abs_xx = abs_xx.sum(dim=(1, 2))         # (B, F)
+        for start in range(0, F, self.chunk_size):
+            end = min(start + self.chunk_size, F)
 
-        # Positive fit term
-        fit_per_feature = sum_abs_xy / M
+            members_chunk = members[:, :, start:end]   # (B, M, Fc)
+            target_chunk = target[:, start:end]        # (B, Fc)
 
-        # Positive spread correction magnitude
-        spread_per_feature = ((1.0 - eps) * sum_abs_xx) / (2 * M * (M - 1))
+            y = target_chunk.unsqueeze(1)              # (B, 1, Fc)
+            abs_xy = torch.abs(members_chunk - y)      # (B, M, Fc)
 
-        # afCRPS = fit - spread
-        loss_per_feature = fit_per_feature - spread_per_feature
+            diff = (
+                members_chunk.unsqueeze(2)
+                - members_chunk.unsqueeze(1)
+            )                                          # (B, M, M, Fc)
+            abs_xx = torch.abs(diff)                   # (B, M, M, Fc)
 
-        fit = fit_per_feature.mean()
-        spread = spread_per_feature.mean()
-        loss = loss_per_feature.mean()
+            sum_abs_xy = abs_xy.sum(dim=1)             # (B, Fc)
+            sum_abs_xx = abs_xx.sum(dim=(1, 2))        # (B, Fc)
+
+            fit_per_feature = sum_abs_xy / M
+            spread_per_feature = ((1.0 - eps) * sum_abs_xx) / (2 * M * (M - 1))
+            loss_per_feature = fit_per_feature - spread_per_feature
+
+            fit_sum += fit_per_feature.sum()
+            spread_sum += spread_per_feature.sum()
+            loss_sum += loss_per_feature.sum()
+            counted_features += fit_per_feature.numel()
+
+        fit = fit_sum / counted_features
+        spread = spread_sum / counted_features
+        loss = loss_sum / counted_features
 
         return loss, fit, spread
 
-    def forward(
-        self,
-        members: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, members: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         loss, _, _ = self.decompose(members, target)
         return loss
 
@@ -161,7 +178,7 @@ class LitParadis(L.LightningModule):
         # ------------------------------------------------------------------ #
         if self.ensemble_mode:
             alpha = cfg.training.get("crps_alpha", 0.95)
-            self.crps_loss = AlmostFairCRPS(alpha=alpha)
+            self.crps_loss = AlmostFairCRPS(alpha=alpha, chunk_size=50000)
             # Keep ParadisLoss for validation RMSE reports only
             self.loss_fn = ParadisLoss(
                 loss_function="mse",

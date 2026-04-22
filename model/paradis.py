@@ -14,27 +14,28 @@ def get_scaled_timestep(original_timestep_seconds: float) -> float:
 
 
 class NoiseEmbedding(nn.Module):
-    """Two-layer MLP + LayerNorm that maps raw Gaussian noise to an embedding."""
+    """Two-layer MLP + LayerNorm that maps raw Gaussian noise to a smaller embedding."""
 
-    def __init__(self, noise_channels: int, hidden_dim: int):
+    def __init__(self, noise_channels: int, emb_dim: int):
         super().__init__()
         self.noise_channels = noise_channels
+        self.emb_dim = emb_dim
         self.mlp = nn.Sequential(
-            nn.Linear(noise_channels, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(noise_channels, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, emb_dim),
         )
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm = nn.LayerNorm(emb_dim)
 
     def forward(self, noise: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            noise: (N, noise_channels)  — N can be B*lat*lon for per-grid-point use
+            noise: (N, noise_channels) — N can be B*lat*lon for per-grid-point use
         Returns:
-            (N, hidden_dim)
+            (N, emb_dim)
         """
         return self.norm(self.mlp(noise))
-    
+
     def sample(
         self,
         batch_size: int,
@@ -46,26 +47,25 @@ class NoiseEmbedding(nn.Module):
         """
         Draws independent noise at every grid point, runs it through the MLP
         point-wise, and returns a spatial embedding field.
- 
+
         Args:
             batch_size: B
             nlat:       number of latitude grid points
             nlon:       number of longitude grid points
-            device:     target device (must match the model's parameters)
-            dtype:      target dtype (must match the model's parameters)
+            device:     target device
+            dtype:      target dtype
         Returns:
-            (B, hidden_dim, lat, lon)
+            (B, emb_dim, lat, lon)
         """
         noise = torch.randn(
             batch_size, self.noise_channels, nlat, nlon,
             device=device, dtype=dtype,
-        )                                                       # (B, C_n, lat, lon)
+        )
         B, C_n, lat, lon = noise.shape
         noise_flat = noise.permute(0, 2, 3, 1).reshape(B * lat * lon, C_n)
-        emb_flat   = self.forward(noise_flat)                   # (B*lat*lon, hidden_dim)
-        hidden_dim = emb_flat.shape[-1]
-        return emb_flat.reshape(B, lat, lon, hidden_dim).permute(0, 3, 1, 2)
-
+        emb_flat = self.forward(noise_flat)   # (B*lat*lon, emb_dim)
+        emb_dim = emb_flat.shape[-1]
+        return emb_flat.reshape(B, lat, lon, emb_dim).permute(0, 3, 1, 2)
 
 
 class Paradis(nn.Module):
@@ -106,15 +106,20 @@ class Paradis(nn.Module):
         self.num_layers = max(1, cfg.model.num_layers)
         self.dt = get_scaled_timestep(cfg.model.get("base_dt")) / self.num_layers
 
+
         # ------------------------------------------------------------------ #
-        # The embedding dimension equals hidden_dim so that ConditionalChannelNorm
-        # layers can project directly from it.
+        # Noise embedding dimension is configurable 
         # ------------------------------------------------------------------ #
         self.noise_channels = cfg.model.get("noise_channels", 0)
-        self.noise_dim = hidden_dim if self.noise_channels > 0 else 0
+        self.noise_mlp_hidden_dim = cfg.model.get("noise_mlp_hidden_dim", 32)
+
+        self.noise_dim = self.noise_mlp_hidden_dim if self.noise_channels > 0 else 0
 
         if self.noise_channels > 0:
-            self.noise_embedding = NoiseEmbedding(self.noise_channels, hidden_dim)
+            self.noise_embedding = NoiseEmbedding(
+                self.noise_channels,
+                self.noise_mlp_hidden_dim,
+            )
         else:
             self.noise_embedding = None
 
@@ -226,6 +231,12 @@ class Paradis(nn.Module):
             bias_channels=bias_channels,
             noise_dim=0,                 # output proj has no pre_normalize
         )
+        
+        print("\nParameter count by top-level module:")
+        for name, module in self.named_children():
+            n = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            print(name, f"{n:,}")
+        print()
 
     def forward(
         self,
@@ -235,7 +246,7 @@ class Paradis(nn.Module):
         """
         Args:
             fields:    (B, C_in, lat, lon)
-            noise_emb: (B, hidden_dim, lat, lon) pre-computed per-grid-point noise
+            noise_emb: (B, noise_dim, lat, lon) pre-computed per-grid-point noise
                        embedding, or None. If None and the model is in ensemble
                        mode, a fresh per-grid-point noise sample is drawn
                        automatically (useful at inference).

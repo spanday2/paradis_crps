@@ -18,7 +18,6 @@ from model.paradis import Paradis
 from utils.loss import ParadisLoss
 from utils.normalization import denormalize_humidity, denormalize_precipitation
 
-
 def _allreduce_scalar(x: torch.Tensor, op: str):
     if not (dist.is_available() and dist.is_initialized()):
         return x
@@ -31,7 +30,6 @@ def _allreduce_scalar(x: torch.Tensor, op: str):
         dist.all_reduce(y, op=dist.ReduceOp.SUM)
         y /= dist.get_world_size()
     return y
-
 
 class AlmostFairCRPS(nn.Module):
     """Almost-fair CRPS loss with chunked feature processing."""
@@ -99,7 +97,6 @@ class AlmostFairCRPS(nn.Module):
     def forward(self, members: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         loss, _, _ = self.decompose(members, target)
         return loss
-
 
 
 

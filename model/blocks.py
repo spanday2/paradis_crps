@@ -94,8 +94,9 @@ class ConditionalChannelNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(input_dim), requires_grad=True)
         self.bias = nn.Parameter(torch.zeros(input_dim), requires_grad=True)
         # Initialised so that at noise_emb=0 the output equals plain ChannelNorm.
-        self.noise_scale = nn.Conv2d(noise_dim, input_dim, kernel_size=1)
-        self.noise_bias  = nn.Conv2d(noise_dim, input_dim, kernel_size=1)
+        self.noise_scale = nn.Linear(noise_dim, input_dim)
+        self.noise_bias  = nn.Linear(noise_dim, input_dim)
+
         nn.init.zeros_(self.noise_scale.weight)
         nn.init.ones_(self.noise_scale.bias)   # scale correction starts at 1
         nn.init.zeros_(self.noise_bias.weight)
@@ -118,9 +119,9 @@ class ConditionalChannelNorm(nn.Module):
         )
         x_norm = x_norm + self.bias[..., :, None, None]
 
-        # Per-grid-point affine modulation — both scale and bias are (B, C, lat, lon)
-        scale = self.noise_scale(noise_emb)   # (B, C, lat, lon)
-        bias  = self.noise_bias(noise_emb)    # (B, C, lat, lon)
+        noise = noise_emb.permute(0, 2, 3, 1)          # (B, lat, lon, noise_dim)
+        scale = self.noise_scale(noise).permute(0, 3, 1, 2)   # (B, C, lat, lon)
+        bias  = self.noise_bias(noise).permute(0, 3, 1, 2)    # (B, C, lat, lon)
         return x_norm * scale + bias
 
 

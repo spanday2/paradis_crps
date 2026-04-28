@@ -232,11 +232,6 @@ class Paradis(nn.Module):
             noise_dim=0,                 # output proj has no pre_normalize
         )
         
-        print("\nParameter count by top-level module:")
-        for name, module in self.named_children():
-            n = sum(p.numel() for p in module.parameters() if p.requires_grad)
-            print(name, f"{n:,}")
-        print()
 
     def forward(
         self,

@@ -10,14 +10,12 @@ from omegaconf import DictConfig
 import torch
 import xarray
 
-
 from data.forcings import time_forcings, toa_radiation
 from utils.normalization import (
     normalize_standard,
     normalize_humidity,
     normalize_precipitation,
 )
-
 
 class ERA5Dataset(torch.utils.data.Dataset):
     """Prepare and process ERA5 dataset for Pytorch."""
@@ -129,8 +127,8 @@ class ERA5Dataset(torch.utils.data.Dataset):
         ds = ds.sel(time=slice(adjusted_start_date, adjusted_end_date))
 
         # Extract latitude and longitude to build the graph
-        self.lat = torch.from_numpy(ds.latitude.values)
-        self.lon = torch.from_numpy(ds.longitude.values)
+        self.lat = torch.from_numpy(ds.latitude.values.copy())
+        self.lon = torch.from_numpy(ds.longitude.values.copy())
         self.lat_size = len(self.lat)
         self.lon_size = len(self.lon)
         self.pressure_levels = features_cfg.pressure_levels
@@ -552,3 +550,4 @@ class ERA5Dataset(torch.utils.data.Dataset):
         distance_lon_mean = torch.mean(distance_lon_inv)
         distance_lon_std = torch.std(distance_lon_inv)
         self.d_lon_inv = (distance_lon_inv - distance_lon_mean) / distance_lon_std
+

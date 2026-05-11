@@ -61,15 +61,35 @@ def main(cfg: DictConfig):
         limit_val_batches=cfg.training.validation_dataset.validation_batches,
         enable_checkpointing=cfg.training.checkpointing.enabled,
         num_sanity_val_steps=0,
-        accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 2),
+        accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
     )
 
     # Keep track of configuration parameters in logging directory
     save_train_config(trainer.logger.log_dir, cfg)  # type: ignore
 
     # Train model
-    checkpoint_path = cfg.init.checkpoint_path if cfg.init.restart else None
-    trainer.fit(litmodel, datamodule=datamodule, ckpt_path=checkpoint_path)
+    # checkpoint_path = cfg.init.checkpoint_path if cfg.init.restart else None
+    # trainer.fit(litmodel, datamodule=datamodule, ckpt_path=checkpoint_path)
+    
+    # Train model
+    checkpoint_type = cfg.init.get("checkpoint_type", "ensemble")
+
+    if checkpoint_type == "deterministic":
+        # Deterministic checkpoint is only used inside LitParadis.__init__
+        # to initialize the ensemble weights.
+        # we don't want to pass it to trainer.fit(..., ckpt_path=...), because Lightning
+        # will try to restore it as a full ensemble checkpoint and fail.
+        fit_ckpt_path = None
+
+    else:
+        # Normal restart from an ensemble Lightning checkpoint
+        fit_ckpt_path = cfg.init.checkpoint_path if cfg.init.restart else None
+
+    trainer.fit(
+        litmodel,
+        datamodule=datamodule,
+        ckpt_path=fit_ckpt_path,
+    )
 
 
 if __name__ == "__main__":

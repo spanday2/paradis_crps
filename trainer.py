@@ -221,17 +221,31 @@ class LitParadis(L.LightningModule):
         self.num_common_features = datamodule.num_common_features
         self.print_losses        = cfg.training.print_losses
 
+        # ------------------------------------------------------------------ #
+        # Checkpoint loading / initialization
+        # ------------------------------------------------------------------ #
+        if (cfg.init.checkpoint_path and not cfg.init.restart) or cfg.forecast.enable:
+            checkpoint_type = cfg.init.get("checkpoint_type", "ensemble")
+
+            if checkpoint_type == "ensemble":
+                self._load_ensemble_checkpoint(cfg.init.checkpoint_path)
+
+            elif checkpoint_type == "deterministic":
+                self._load_deterministic_checkpoint_into_ensemble(
+                    cfg.init.checkpoint_path
+                )
+
+            else:
+                raise ValueError(
+                    f"Unknown cfg.init.checkpoint_type={checkpoint_type}. "
+                    "Use 'ensemble' or 'deterministic'."
+                )
+
+        # Compile after loading weights
         if cfg.compute.compile:
             self.model.compile(
                 mode="default", fullgraph=True, dynamic=False, backend="inductor"
             )
-
-        if (cfg.init.checkpoint_path and not cfg.init.restart) or cfg.forecast.enable:
-            checkpoint = torch.load(
-                cfg.init.checkpoint_path, weights_only=True, map_location="cpu"
-            )
-            state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint      
-            self.load_state_dict(state_dict, strict=True)
             
 
         if not cfg.forecast.enable and cfg.training.reports.enable:
@@ -249,7 +263,288 @@ class LitParadis(L.LightningModule):
     # ---------------------------------------------------------------------- #
     # Helpers
     # ---------------------------------------------------------------------- #
+    
+    # ---------------------------------------------------------------------- #
+    # Checkpoint initialization helpers
+    # ---------------------------------------------------------------------- #
 
+    def _read_checkpoint_state_dict(self, checkpoint_path: str) -> dict:
+        checkpoint = torch.load(
+            checkpoint_path,
+            weights_only=True,
+            map_location="cpu",
+        )
+        return checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+
+    def _load_ensemble_checkpoint(self, checkpoint_path: str) -> None:
+        """
+        Normal ensemble checkpoint loading.
+
+        Use this when the checkpoint already comes from the ensemble model.
+        """
+        state_dict = self._read_checkpoint_state_dict(checkpoint_path)
+        self.load_state_dict(state_dict, strict=True)
+
+        if self.global_rank == 0:
+            logging.info(f"Loaded ensemble checkpoint from: {checkpoint_path}")
+
+    def _load_deterministic_checkpoint_into_ensemble(self, checkpoint_path: str) -> None:
+        """
+        Initialize the ensemble model from a deterministic checkpoint.
+
+        This function does four things:
+
+        1. Directly copies parameters whose names and shapes are unchanged.
+        2. Maps deterministic ChannelNorm parameters to ensemble cond_norm parameters.
+        3. Maps renamed block-body parameters, e.g.
+              old: model.diffusion.0.0-SepConv...
+              new: model.diffusion.0.body.0-SepConv...
+        4. Neutralizes the noise-conditioning pathway so that initially:
+              noise_scale = 1
+              noise_bias  = 0
+
+        Therefore, at initialization, the ensemble model behaves as close as
+        possible to the deterministic model.
+        """
+        det_state = self._read_checkpoint_state_dict(checkpoint_path)
+
+        # Current ensemble model state
+        ens_state = self.state_dict()
+
+        # Start from current ensemble initialization.
+        # Then overwrite parameters that can be initialized from deterministic.
+        new_state = dict(ens_state)
+
+        directly_copied = []
+        norm_mapped = []
+        body_mapped = []
+        noise_neutralized = []
+
+        # -------------------------------------------------------------- #
+        # 1. Direct copy for keys that still match exactly
+        # -------------------------------------------------------------- #
+        for k, v in det_state.items():
+            if k in new_state and new_state[k].shape == v.shape:
+                new_state[k] = v
+                directly_copied.append(k)
+
+        # -------------------------------------------------------------- #
+        # 2. Explicit norm mapping
+        #
+        # deterministic:
+        #     model.velocity_nets.0.0-ChannelNorm.weight
+        #     model.velocity_nets.0.0-ChannelNorm.bias
+        #
+        # ensemble:
+        #     model.velocity_nets.0.cond_norm.weight
+        #     model.velocity_nets.0.cond_norm.bias
+        #
+        # Same pattern for velocity_nets, diffusion, and reaction.
+        # -------------------------------------------------------------- #
+        for k, v in det_state.items():
+            new_k = None
+
+            if k.endswith(".0-ChannelNorm.weight"):
+                new_k = k.replace(".0-ChannelNorm.weight", ".cond_norm.weight")
+
+            elif k.endswith(".0-ChannelNorm.bias"):
+                new_k = k.replace(".0-ChannelNorm.bias", ".cond_norm.bias")
+
+            if new_k is not None:
+                if new_k in new_state and new_state[new_k].shape == v.shape:
+                    new_state[new_k] = v
+                    norm_mapped.append((k, new_k))
+
+        # -------------------------------------------------------------- #
+        # 3. Map renamed block-body parameters
+        #
+        # Examples:
+        #
+        # old:
+        #     model.velocity_nets.0.0-SepConv.depthwise.weight
+        #
+        # new:
+        #     model.velocity_nets.0.body.0-SepConv.depthwise.weight
+        #
+        # Similar renaming happens in:
+        #     velocity_nets
+        #     diffusion
+        #     reaction
+        #     advection down_projection
+        #     advection up_projection
+        #     output_proj
+        # -------------------------------------------------------------- #
+        for k, v in det_state.items():
+            candidate_keys = []
+
+            # velocity_nets / diffusion / reaction:
+            #
+            # old:
+            #     model.velocity_nets.0.0-SepConv...
+            #
+            # new:
+            #     model.velocity_nets.0.body.0-SepConv...
+            for block_name in ["velocity_nets", "diffusion", "reaction"]:
+                prefix = f"model.{block_name}."
+
+                if k.startswith(prefix):
+                    parts = k.split(".")
+
+                    # Example:
+                    # ['model', 'velocity_nets', '0', '0-SepConv', ...]
+                    if len(parts) >= 4 and parts[3].startswith(("0-", "1-")):
+                        new_parts = parts[:3] + ["body"] + parts[3:]
+                        candidate_keys.append(".".join(new_parts))
+
+            # advection down_projection:
+            #
+            # old:
+            #     model.advection.0.down_projection.0-CLinear...
+            #
+            # new:
+            #     model.advection.0.down_projection.body.0-CLinear...
+            if ".down_projection.0-" in k:
+                candidate_keys.append(
+                    k.replace(".down_projection.0-", ".down_projection.body.0-")
+                )
+
+            # advection up_projection:
+            #
+            # old:
+            #     model.advection.0.up_projection.0-SepConv...
+            #
+            # new:
+            #     model.advection.0.up_projection.body.0-SepConv...
+            if ".up_projection.0-" in k:
+                candidate_keys.append(
+                    k.replace(".up_projection.0-", ".up_projection.body.0-")
+                )
+
+            # output projection:
+            #
+            # old:
+            #     model.output_proj.0-SepConv...
+            #
+            # new:
+            #     model.output_proj.body.0-SepConv...
+            if k.startswith("model.output_proj."):
+                parts = k.split(".")
+
+                # Example:
+                # ['model', 'output_proj', '0-SepConv', ...]
+                if len(parts) >= 3 and parts[2].startswith(("0-", "1-")):
+                    new_parts = parts[:2] + ["body"] + parts[2:]
+                    candidate_keys.append(".".join(new_parts))
+
+            for new_k in candidate_keys:
+                if new_k in new_state and new_state[new_k].shape == v.shape:
+                    new_state[new_k] = v
+                    body_mapped.append((k, new_k))
+                    break
+
+        # -------------------------------------------------------------- #
+        # 4. Neutralize noise-conditioning layers
+        #
+        # Ensemble keys look like:
+        #
+        #     model.diffusion.0.cond_norm.noise_scale.weight
+        #     model.diffusion.0.cond_norm.noise_scale.bias
+        #     model.diffusion.0.cond_norm.noise_bias.weight
+        #     model.diffusion.0.cond_norm.noise_bias.bias
+        #
+        # We initialize:
+        #
+        #     noise_scale.weight = 0
+        #     noise_scale.bias   = 1
+        #     noise_bias.weight  = 0
+        #     noise_bias.bias    = 0
+        #
+        # Therefore, initially:
+        #
+        #     output = 1 * norm(x) + 0
+        #
+        # So the noise pathway has no effect at step 0.
+        # -------------------------------------------------------------- #
+        for k in list(new_state.keys()):
+            if k.endswith("noise_scale.weight"):
+                new_state[k] = torch.zeros_like(new_state[k])
+                noise_neutralized.append(k)
+
+            elif k.endswith("noise_scale.bias"):
+                new_state[k] = torch.ones_like(new_state[k])
+                noise_neutralized.append(k)
+
+            elif k.endswith("noise_bias.weight"):
+                new_state[k] = torch.zeros_like(new_state[k])
+                noise_neutralized.append(k)
+
+            elif k.endswith("noise_bias.bias"):
+                new_state[k] = torch.zeros_like(new_state[k])
+                noise_neutralized.append(k)
+
+        # -------------------------------------------------------------- #
+        # 5. Strict load after building a complete ensemble state_dict
+        # -------------------------------------------------------------- #
+        self.load_state_dict(new_state, strict=True)
+
+        # -------------------------------------------------------------- #
+        # 6. Logging
+        # -------------------------------------------------------------- #
+        if self.global_rank == 0:
+            loaded_old_keys = set(directly_copied)
+            loaded_old_keys.update(old_k for old_k, _ in norm_mapped)
+            loaded_old_keys.update(old_k for old_k, _ in body_mapped)
+
+            truly_skipped = [
+                k for k in det_state.keys()
+                if k not in loaded_old_keys
+            ]
+            
+            from collections import Counter
+
+            suffix_counter = Counter()
+
+            for k in truly_skipped:
+                if "GlobalBias.A" in k:
+                    suffix_counter["GlobalBias.A"] += 1
+                elif "GlobalBias.U" in k:
+                    suffix_counter["GlobalBias.U"] += 1
+                elif "GlobalBias.V" in k:
+                    suffix_counter["GlobalBias.V"] += 1
+                else:
+                    suffix_counter["other"] += 1
+
+            
+
+            logging.info("=" * 40)
+            logging.info("Initialized ensemble model from deterministic checkpoint")
+            logging.info(f"Checkpoint: {checkpoint_path}")
+            logging.info(f"Directly copied keys: {len(directly_copied)}")
+            logging.info(f"Mapped norm keys: {len(norm_mapped)}")
+            logging.info(f"Mapped renamed body keys: {len(body_mapped)}")
+            logging.info(f"Neutralized noise-conditioning keys: {len(noise_neutralized)}")
+            logging.info(f"Truly skipped deterministic keys: {len(truly_skipped)}")
+            logging.info(f"Skipped key summary: {dict(suffix_counter)}")
+
+            # logging.info("First 20 mapped norm keys:")
+            # for old_k, new_k in norm_mapped[:20]:
+            #     logging.info(f"  {old_k}  -->  {new_k}")
+
+            # logging.info("First 20 mapped body keys:")
+            # for old_k, new_k in body_mapped[:20]:
+            #     logging.info(f"  {old_k}  -->  {new_k}")
+
+            # logging.info("First 20 neutralized noise-conditioning keys:")
+            # for k in noise_neutralized[:20]:
+            #     logging.info(f"  neutralized: {k}")
+
+            # logging.info("First 20 truly skipped deterministic keys:")
+            # for k in truly_skipped[:20]:
+            #     logging.info(f"  skipped: {k}")
+
+            logging.info("=" * 40)
+     
+            
     def _autoregression_input_from_output(
         self,
         input_data: torch.Tensor,

@@ -38,11 +38,12 @@ class AlmostFairCRPS(nn.Module):
         self,
         alpha: float = 0.95,
         lat_weights: torch.Tensor | None = None,
-        chunk_size: int = 200000,
+        chunk_size: int | None = None,
     ):
         super().__init__()
         self.alpha = alpha
-        self.chunk_size = chunk_size
+        # self.chunk_size = chunk_size
+        self.chunk_size = chunk_size if chunk_size is not None else 10**15 
         if lat_weights is not None:
             self.register_buffer("lat_weights", lat_weights)
         else:
@@ -175,7 +176,7 @@ class LitParadis(L.LightningModule):
         # ------------------------------------------------------------------ #
         if self.ensemble_mode:
             alpha = cfg.training.get("crps_alpha", 0.95)
-            self.crps_loss = AlmostFairCRPS(alpha=alpha, chunk_size=50000)
+            self.crps_loss = AlmostFairCRPS(alpha=alpha, chunk_size=None)
             # Keep ParadisLoss for validation RMSE reports only
             self.loss_fn = ParadisLoss(
                 loss_function="mse",

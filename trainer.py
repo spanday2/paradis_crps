@@ -18,10 +18,13 @@ from model.paradis import Paradis
 from utils.loss import ParadisLoss
 from utils.normalization import denormalize_humidity, denormalize_precipitation
 
+
 def _allreduce_scalar(x: torch.Tensor, op: str):
     if not (dist.is_available() and dist.is_initialized()):
         return x
+
     y = x.detach().clone()
+
     if op == "max":
         dist.all_reduce(y, op=dist.ReduceOp.MAX)
     elif op == "min":
@@ -29,97 +32,84 @@ def _allreduce_scalar(x: torch.Tensor, op: str):
     else:
         dist.all_reduce(y, op=dist.ReduceOp.SUM)
         y /= dist.get_world_size()
+
     return y
 
-class AlmostFairCRPS(nn.Module):
-    """Almost-fair CRPS loss with chunked feature processing."""
 
-    def __init__(
-        self,
-        alpha: float = 0.95,
-        lat_weights: torch.Tensor | None = None,
-        chunk_size: int | None = None,
-    ):
+class TwoMemberAlmostFairCRPS(nn.Module):
+    """Memory-efficient two-member almost-fair CRPS utilities.
+
+    For two members, the loss is
+
+        0.5 * |x1 - y| + 0.5 * |x2 - y| - 0.5 * C * |x1 - x2|
+
+    where, matching the previous AlmostFairCRPS implementation,
+
+        eps = (1 - alpha) / 2
+        C   = 1 - eps
+
+    If alpha=1, this becomes the fair two-member coefficient C=1.
+    If the standard unfair CRPS coefficient for M=2 is desired, set
+    training.crps_pairwise_coeff = 0.5 in the config.
+    """
+
+    def __init__(self, alpha: float = 0.95, pairwise_coeff: float | None = None):
         super().__init__()
         self.alpha = alpha
-        # self.chunk_size = chunk_size
-        self.chunk_size = chunk_size if chunk_size is not None else 10**15 
-        if lat_weights is not None:
-            self.register_buffer("lat_weights", lat_weights)
-        else:
-            self.lat_weights = None
+        self.pairwise_coeff = pairwise_coeff
 
-    def decompose(
+    @property
+    def c(self) -> float:
+        if self.pairwise_coeff is not None:
+            return float(self.pairwise_coeff)
+
+        eps = (1.0 - float(self.alpha)) / 2.0
+        return 1.0 - eps
+
+    @staticmethod
+    def _mean_abs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.mean(torch.abs(a - b))
+
+    def fit_term(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return 0.5 * self._mean_abs(x, y)
+
+    def spread_term(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        return 0.5 * self.c * self._mean_abs(x1, x2)
+
+    def full_loss_for_logging(
         self,
-        members: torch.Tensor,   # (B, M, F)
-        target: torch.Tensor,    # (B, F)
-    ):
-        B, M, F = members.shape
-        eps = (1.0 - self.alpha) / M
-
-        fit_sum = members.new_zeros(())
-        spread_sum = members.new_zeros(())
-        loss_sum = members.new_zeros(())
-        counted_features = 0
-
-        for start in range(0, F, self.chunk_size):
-            end = min(start + self.chunk_size, F)
-
-            members_chunk = members[:, :, start:end]   # (B, M, Fc)
-            target_chunk = target[:, start:end]        # (B, Fc)
-
-            y = target_chunk.unsqueeze(1)              # (B, 1, Fc)
-            abs_xy = torch.abs(members_chunk - y)      # (B, M, Fc)
-
-            diff = (
-                members_chunk.unsqueeze(2)
-                - members_chunk.unsqueeze(1)
-            )                                          # (B, M, M, Fc)
-            abs_xx = torch.abs(diff)                   # (B, M, M, Fc)
-
-            sum_abs_xy = abs_xy.sum(dim=1)             # (B, Fc)
-            sum_abs_xx = abs_xx.sum(dim=(1, 2))        # (B, Fc)
-
-            fit_per_feature = sum_abs_xy / M
-            spread_per_feature = ((1.0 - eps) * sum_abs_xx) / (2 * M * (M - 1))
-            loss_per_feature = fit_per_feature - spread_per_feature
-
-            fit_sum += fit_per_feature.sum()
-            spread_sum += spread_per_feature.sum()
-            loss_sum += loss_per_feature.sum()
-            counted_features += fit_per_feature.numel()
-
-        fit = fit_sum / counted_features
-        spread = spread_sum / counted_features
-        loss = loss_sum / counted_features
-
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fit = self.fit_term(x1, y) + self.fit_term(x2, y)
+        spread = self.spread_term(x1, x2)
+        loss = fit - spread
         return loss, fit, spread
-
-    def forward(self, members: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss, _, _ = self.decompose(members, target)
-        return loss
-
 
 
 class LitParadis(L.LightningModule):
-    """Lightning module for Paradis ensemble
+    """Lightning module for Paradis ensemble.
 
     Ensemble mode is activated by setting cfg.model.noise_channels > 0.
-    When noise_channels == 0 the module is identical to the original
-    deterministic Paradis.
+    When noise_channels == 0 the module is identical to deterministic Paradis.
     """
 
     model: torch.nn.Module
 
     def __init__(
-        self, datamodule: Era5DataModule, cfg: omegaconf.dictconfig.DictConfig
+        self,
+        datamodule: Era5DataModule,
+        cfg: omegaconf.dictconfig.DictConfig,
     ) -> None:
         super().__init__()
 
         self.min_dt = 1e10
         self.datamodule = datamodule
+
         lat_grid = datamodule.dataset.lat_rad_grid
         lon_grid = datamodule.dataset.lon_rad_grid
+
         self.model = Paradis(datamodule, cfg, lat_grid, lon_grid)
         self.cfg = cfg
         self.n_inputs = cfg.dataset.n_time_inputs
@@ -127,17 +117,37 @@ class LitParadis(L.LightningModule):
         # ------------------------------------------------------------------ #
         # Ensemble configuration
         # ------------------------------------------------------------------ #
-        self.noise_channels      = cfg.model.get("noise_channels", 0)
-        self.ensemble_mode       = self.noise_channels > 0
-        self.num_members         = cfg.training.get("num_ensemble_members", 4)
+        self.noise_channels = cfg.model.get("noise_channels", 0)
+        self.ensemble_mode = self.noise_channels > 0
+        self.num_members = cfg.training.get("num_ensemble_members", 2)
 
-        # Spatial grid dimensions — needed for per-grid-point noise sampling
         self.nlat = lat_grid.shape[0]
         self.nlon = lat_grid.shape[1]
 
-        num_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # if self.ensemble_mode and self.num_members != 2:
+        #     raise ValueError(
+        #         "The memory-efficient streaming afCRPS trainer is implemented only "
+        #         f"for two members, but got num_ensemble_members={self.num_members}."
+        #     )
+
+        # if self.ensemble_mode:
+        #     self.automatic_optimization = False
+        if self.ensemble_mode and not cfg.forecast.enable:
+            if self.num_members != 2:
+                raise ValueError(
+                    "The memory-efficient streaming afCRPS trainer is implemented only for "
+                    f"two training members, but got num_ensemble_members={self.num_members}."
+                )
+
+            self.automatic_optimization = False
+
+        num_parameters = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
+
         if self.global_rank == 0:
             logging.info("Number of trainable parameters: {:,}".format(num_parameters))
+
             if self.ensemble_mode:
                 logging.info(
                     f"Ensemble mode: {self.num_members} members, "
@@ -147,27 +157,39 @@ class LitParadis(L.LightningModule):
         self.output_name_order = datamodule.output_name_order
         num_levels = len(cfg.features.pressure_levels)
 
-        # Variable loss weights (unchanged)
+        # ------------------------------------------------------------------ #
+        # Variable loss weights
+        # ------------------------------------------------------------------ #
         atmospheric_weights = torch.tensor(
-            [cfg.training.variable_loss_weights.atmospheric[v]
-             for v in cfg.features.output.atmospheric],
+            [
+                cfg.training.variable_loss_weights.atmospheric[v]
+                for v in cfg.features.output.atmospheric
+            ],
             dtype=torch.float32,
         )
+
         surface_weights = torch.tensor(
-            [cfg.training.variable_loss_weights.surface[v]
-             for v in cfg.features.output.surface],
+            [
+                cfg.training.variable_loss_weights.surface[v]
+                for v in cfg.features.output.surface
+            ],
             dtype=torch.float32,
         )
+
         atmospheric_vars = cfg.features.output.atmospheric
-        surface_vars     = cfg.features.output.surface
+        surface_vars = cfg.features.output.surface
+
         var_name_to_weight = {
             **{v: atmospheric_weights[i] for i, v in enumerate(atmospheric_vars)},
-            **{v: surface_weights[i]     for i, v in enumerate(surface_vars)},
+            **{v: surface_weights[i] for i, v in enumerate(surface_vars)},
         }
+
         num_features = len(atmospheric_weights) * num_levels + len(surface_weights)
         var_loss_weights_reordered = torch.zeros(num_features, dtype=torch.float32)
+
         for i, var in enumerate(self.output_name_order):
             var_name = re.sub(r"_h\d+$", "", var)
+
             if var_name in var_name_to_weight:
                 var_loss_weights_reordered[i] = var_name_to_weight[var_name]
 
@@ -176,12 +198,21 @@ class LitParadis(L.LightningModule):
         # ------------------------------------------------------------------ #
         if self.ensemble_mode:
             alpha = cfg.training.get("crps_alpha", 0.95)
-            self.crps_loss = AlmostFairCRPS(alpha=alpha, chunk_size=None)
-            # Keep ParadisLoss for validation RMSE reports only
+            pairwise_coeff = cfg.training.get("crps_pairwise_coeff", None)
+
+            self.crps_loss = TwoMemberAlmostFairCRPS(
+                alpha=alpha,
+                pairwise_coeff=pairwise_coeff,
+            )
+
+            # Keep ParadisLoss for validation/report RMSE.
             self.loss_fn = ParadisLoss(
                 loss_function="mse",
                 lat_grid=datamodule.lat,
-                pressure_levels=torch.tensor(cfg.features.pressure_levels, dtype=torch.float32),
+                pressure_levels=torch.tensor(
+                    cfg.features.pressure_levels,
+                    dtype=torch.float32,
+                ),
                 num_features=datamodule.num_out_features,
                 num_surface_vars=len(cfg.features.output.surface),
                 var_loss_weights=var_loss_weights_reordered,
@@ -191,10 +222,14 @@ class LitParadis(L.LightningModule):
             )
         else:
             self.crps_loss = None
+
             self.loss_fn = ParadisLoss(
                 loss_function=cfg.training.loss_function.type,
                 lat_grid=datamodule.lat,
-                pressure_levels=torch.tensor(cfg.features.pressure_levels, dtype=torch.float32),
+                pressure_levels=torch.tensor(
+                    cfg.features.pressure_levels,
+                    dtype=torch.float32,
+                ),
                 num_features=datamodule.num_out_features,
                 num_surface_vars=len(cfg.features.output.surface),
                 var_loss_weights=var_loss_weights_reordered,
@@ -204,11 +239,15 @@ class LitParadis(L.LightningModule):
             )
 
         validation_loss_type = cfg.training.loss_function.get("validation_loss", None)
+
         if validation_loss_type is not None:
             self.val_loss_fn = ParadisLoss(
                 loss_function=validation_loss_type,
                 lat_grid=datamodule.lat,
-                pressure_levels=torch.tensor(cfg.features.pressure_levels, dtype=torch.float32),
+                pressure_levels=torch.tensor(
+                    cfg.features.pressure_levels,
+                    dtype=torch.float32,
+                ),
                 num_features=datamodule.num_out_features,
                 num_surface_vars=len(cfg.features.output.surface),
                 var_loss_weights=var_loss_weights_reordered,
@@ -220,332 +259,43 @@ class LitParadis(L.LightningModule):
             self.val_loss_fn = self.loss_fn
 
         self.num_common_features = datamodule.num_common_features
-        self.print_losses        = cfg.training.print_losses
+        self.print_losses = cfg.training.print_losses
 
-        # ------------------------------------------------------------------ #
-        # Checkpoint loading / initialization
-        # ------------------------------------------------------------------ #
-        if (cfg.init.checkpoint_path and not cfg.init.restart) or cfg.forecast.enable:
-            checkpoint_type = cfg.init.get("checkpoint_type", "ensemble")
-
-            if checkpoint_type == "ensemble":
-                self._load_ensemble_checkpoint(cfg.init.checkpoint_path)
-
-            elif checkpoint_type == "deterministic":
-                self._load_deterministic_checkpoint_into_ensemble(
-                    cfg.init.checkpoint_path
-                )
-
-            else:
-                raise ValueError(
-                    f"Unknown cfg.init.checkpoint_type={checkpoint_type}. "
-                    "Use 'ensemble' or 'deterministic'."
-                )
-
-        # Compile after loading weights
         if cfg.compute.compile:
             self.model.compile(
-                mode="default", fullgraph=True, dynamic=False, backend="inductor"
+                mode="default",
+                fullgraph=True,
+                dynamic=False,
+                backend="inductor",
             )
-            
+
+        if (cfg.init.checkpoint_path and not cfg.init.restart) or cfg.forecast.enable:
+            checkpoint = torch.load(
+                cfg.init.checkpoint_path,
+                weights_only=True,
+                map_location="cpu",
+            )
+            state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+            self.load_state_dict(state_dict, strict=True)
 
         if not cfg.forecast.enable and cfg.training.reports.enable:
             self.report_features = cfg.training.reports.features
             self.report_ind = torch.tensor(
-                [datamodule.dataset.dyn_input_features.index(f)
-                 for f in cfg.training.reports.features],
+                [
+                    datamodule.dataset.dyn_input_features.index(f)
+                    for f in cfg.training.reports.features
+                ],
                 dtype=torch.long,
             )
             self.report_mean = torch.from_numpy(datamodule.dataset.report_stats["mean"])
-            self.report_std  = torch.from_numpy(datamodule.dataset.report_stats["std"])
+            self.report_std = torch.from_numpy(datamodule.dataset.report_stats["std"])
 
         self.custom_norms = not cfg.normalization.standard
 
     # ---------------------------------------------------------------------- #
     # Helpers
     # ---------------------------------------------------------------------- #
-    
-    # ---------------------------------------------------------------------- #
-    # Checkpoint initialization helpers
-    # ---------------------------------------------------------------------- #
 
-    def _read_checkpoint_state_dict(self, checkpoint_path: str) -> dict:
-        checkpoint = torch.load(
-            checkpoint_path,
-            weights_only=True,
-            map_location="cpu",
-        )
-        return checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-
-    def _load_ensemble_checkpoint(self, checkpoint_path: str) -> None:
-        """
-        Normal ensemble checkpoint loading.
-
-        Use this when the checkpoint already comes from the ensemble model.
-        """
-        state_dict = self._read_checkpoint_state_dict(checkpoint_path)
-        self.load_state_dict(state_dict, strict=True)
-
-        if self.global_rank == 0:
-            logging.info(f"Loaded ensemble checkpoint from: {checkpoint_path}")
-
-    def _load_deterministic_checkpoint_into_ensemble(self, checkpoint_path: str) -> None:
-        """
-        Initialize the ensemble model from a deterministic checkpoint.
-
-        This function does four things:
-
-        1. Directly copies parameters whose names and shapes are unchanged.
-        2. Maps deterministic ChannelNorm parameters to ensemble cond_norm parameters.
-        3. Maps renamed block-body parameters, e.g.
-              old: model.diffusion.0.0-SepConv...
-              new: model.diffusion.0.body.0-SepConv...
-        4. Neutralizes the noise-conditioning pathway so that initially:
-              noise_scale = 1
-              noise_bias  = 0
-
-        Therefore, at initialization, the ensemble model behaves as close as
-        possible to the deterministic model.
-        """
-        det_state = self._read_checkpoint_state_dict(checkpoint_path)
-
-        # Current ensemble model state
-        ens_state = self.state_dict()
-
-        # Start from current ensemble initialization.
-        # Then overwrite parameters that can be initialized from deterministic.
-        new_state = dict(ens_state)
-
-        directly_copied = []
-        norm_mapped = []
-        body_mapped = []
-        noise_neutralized = []
-
-        # -------------------------------------------------------------- #
-        # 1. Direct copy for keys that still match exactly
-        # -------------------------------------------------------------- #
-        for k, v in det_state.items():
-            if k in new_state and new_state[k].shape == v.shape:
-                new_state[k] = v
-                directly_copied.append(k)
-
-        # -------------------------------------------------------------- #
-        # 2. Explicit norm mapping
-        #
-        # deterministic:
-        #     model.velocity_nets.0.0-ChannelNorm.weight
-        #     model.velocity_nets.0.0-ChannelNorm.bias
-        #
-        # ensemble:
-        #     model.velocity_nets.0.cond_norm.weight
-        #     model.velocity_nets.0.cond_norm.bias
-        #
-        # Same pattern for velocity_nets, diffusion, and reaction.
-        # -------------------------------------------------------------- #
-        for k, v in det_state.items():
-            new_k = None
-
-            if k.endswith(".0-ChannelNorm.weight"):
-                new_k = k.replace(".0-ChannelNorm.weight", ".cond_norm.weight")
-
-            elif k.endswith(".0-ChannelNorm.bias"):
-                new_k = k.replace(".0-ChannelNorm.bias", ".cond_norm.bias")
-
-            if new_k is not None:
-                if new_k in new_state and new_state[new_k].shape == v.shape:
-                    new_state[new_k] = v
-                    norm_mapped.append((k, new_k))
-
-        # -------------------------------------------------------------- #
-        # 3. Map renamed block-body parameters
-        #
-        # Examples:
-        #
-        # old:
-        #     model.velocity_nets.0.0-SepConv.depthwise.weight
-        #
-        # new:
-        #     model.velocity_nets.0.body.0-SepConv.depthwise.weight
-        #
-        # Similar renaming happens in:
-        #     velocity_nets
-        #     diffusion
-        #     reaction
-        #     advection down_projection
-        #     advection up_projection
-        #     output_proj
-        # -------------------------------------------------------------- #
-        for k, v in det_state.items():
-            candidate_keys = []
-
-            # velocity_nets / diffusion / reaction:
-            #
-            # old:
-            #     model.velocity_nets.0.0-SepConv...
-            #
-            # new:
-            #     model.velocity_nets.0.body.0-SepConv...
-            for block_name in ["velocity_nets", "diffusion", "reaction"]:
-                prefix = f"model.{block_name}."
-
-                if k.startswith(prefix):
-                    parts = k.split(".")
-
-                    # Example:
-                    # ['model', 'velocity_nets', '0', '0-SepConv', ...]
-                    if len(parts) >= 4 and parts[3].startswith(("0-", "1-")):
-                        new_parts = parts[:3] + ["body"] + parts[3:]
-                        candidate_keys.append(".".join(new_parts))
-
-            # advection down_projection:
-            #
-            # old:
-            #     model.advection.0.down_projection.0-CLinear...
-            #
-            # new:
-            #     model.advection.0.down_projection.body.0-CLinear...
-            if ".down_projection.0-" in k:
-                candidate_keys.append(
-                    k.replace(".down_projection.0-", ".down_projection.body.0-")
-                )
-
-            # advection up_projection:
-            #
-            # old:
-            #     model.advection.0.up_projection.0-SepConv...
-            #
-            # new:
-            #     model.advection.0.up_projection.body.0-SepConv...
-            if ".up_projection.0-" in k:
-                candidate_keys.append(
-                    k.replace(".up_projection.0-", ".up_projection.body.0-")
-                )
-
-            # output projection:
-            #
-            # old:
-            #     model.output_proj.0-SepConv...
-            #
-            # new:
-            #     model.output_proj.body.0-SepConv...
-            if k.startswith("model.output_proj."):
-                parts = k.split(".")
-
-                # Example:
-                # ['model', 'output_proj', '0-SepConv', ...]
-                if len(parts) >= 3 and parts[2].startswith(("0-", "1-")):
-                    new_parts = parts[:2] + ["body"] + parts[2:]
-                    candidate_keys.append(".".join(new_parts))
-
-            for new_k in candidate_keys:
-                if new_k in new_state and new_state[new_k].shape == v.shape:
-                    new_state[new_k] = v
-                    body_mapped.append((k, new_k))
-                    break
-
-        # -------------------------------------------------------------- #
-        # 4. Neutralize noise-conditioning layers
-        #
-        # Ensemble keys look like:
-        #
-        #     model.diffusion.0.cond_norm.noise_scale.weight
-        #     model.diffusion.0.cond_norm.noise_scale.bias
-        #     model.diffusion.0.cond_norm.noise_bias.weight
-        #     model.diffusion.0.cond_norm.noise_bias.bias
-        #
-        # We initialize:
-        #
-        #     noise_scale.weight = 0
-        #     noise_scale.bias   = 1
-        #     noise_bias.weight  = 0
-        #     noise_bias.bias    = 0
-        #
-        # Therefore, initially:
-        #
-        #     output = 1 * norm(x) + 0
-        #
-        # So the noise pathway has no effect at step 0.
-        # -------------------------------------------------------------- #
-        for k in list(new_state.keys()):
-            if k.endswith("noise_scale.weight"):
-                new_state[k] = torch.zeros_like(new_state[k])
-                noise_neutralized.append(k)
-
-            elif k.endswith("noise_scale.bias"):
-                new_state[k] = torch.ones_like(new_state[k])
-                noise_neutralized.append(k)
-
-            elif k.endswith("noise_bias.weight"):
-                new_state[k] = torch.zeros_like(new_state[k])
-                noise_neutralized.append(k)
-
-            elif k.endswith("noise_bias.bias"):
-                new_state[k] = torch.zeros_like(new_state[k])
-                noise_neutralized.append(k)
-
-        # -------------------------------------------------------------- #
-        # 5. Strict load after building a complete ensemble state_dict
-        # -------------------------------------------------------------- #
-        self.load_state_dict(new_state, strict=True)
-
-        # -------------------------------------------------------------- #
-        # 6. Logging
-        # -------------------------------------------------------------- #
-        if self.global_rank == 0:
-            loaded_old_keys = set(directly_copied)
-            loaded_old_keys.update(old_k for old_k, _ in norm_mapped)
-            loaded_old_keys.update(old_k for old_k, _ in body_mapped)
-
-            truly_skipped = [
-                k for k in det_state.keys()
-                if k not in loaded_old_keys
-            ]
-            
-            from collections import Counter
-
-            suffix_counter = Counter()
-
-            for k in truly_skipped:
-                if "GlobalBias.A" in k:
-                    suffix_counter["GlobalBias.A"] += 1
-                elif "GlobalBias.U" in k:
-                    suffix_counter["GlobalBias.U"] += 1
-                elif "GlobalBias.V" in k:
-                    suffix_counter["GlobalBias.V"] += 1
-                else:
-                    suffix_counter["other"] += 1
-
-            
-
-            logging.info("=" * 40)
-            logging.info("Initialized ensemble model from deterministic checkpoint")
-            logging.info(f"Checkpoint: {checkpoint_path}")
-            logging.info(f"Directly copied keys: {len(directly_copied)}")
-            logging.info(f"Mapped norm keys: {len(norm_mapped)}")
-            logging.info(f"Mapped renamed body keys: {len(body_mapped)}")
-            logging.info(f"Neutralized noise-conditioning keys: {len(noise_neutralized)}")
-            logging.info(f"Truly skipped deterministic keys: {len(truly_skipped)}")
-            logging.info(f"Skipped key summary: {dict(suffix_counter)}")
-
-            # logging.info("First 20 mapped norm keys:")
-            # for old_k, new_k in norm_mapped[:20]:
-            #     logging.info(f"  {old_k}  -->  {new_k}")
-
-            # logging.info("First 20 mapped body keys:")
-            # for old_k, new_k in body_mapped[:20]:
-            #     logging.info(f"  {old_k}  -->  {new_k}")
-
-            # logging.info("First 20 neutralized noise-conditioning keys:")
-            # for k in noise_neutralized[:20]:
-            #     logging.info(f"  neutralized: {k}")
-
-            # logging.info("First 20 truly skipped deterministic keys:")
-            # for k in truly_skipped[:20]:
-            #     logging.info(f"  skipped: {k}")
-
-            logging.info("=" * 40)
-     
-            
     def _autoregression_input_from_output(
         self,
         input_data: torch.Tensor,
@@ -555,171 +305,455 @@ class LitParadis(L.LightningModule):
     ) -> torch.Tensor:
         new_input_data = input_data.clone()
         steps_left = num_steps - step - 1
+
         for i in range(min(steps_left, self.n_inputs)):
             beg_i = self.num_common_features * (self.n_inputs - i - 1)
             end_i = self.num_common_features * (self.n_inputs - i)
+
             new_input_data[:, step + i + 1, beg_i:end_i] = output_data[
                 :, : self.num_common_features
             ]
+
         return new_input_data
 
     def _get_report_rmse(self, output_data, pred_data):
-        lat_weights = self.loss_fn.lat_weights.view(1, 1, -1, 1).to(output_data.device)
-        errors = torch.empty(len(self.report_ind), dtype=output_data.dtype, device=output_data.device)
+        lat_weights = self.loss_fn.lat_weights.view(1, 1, -1, 1).to(
+            output_data.device
+        )
+
+        errors = torch.empty(
+            len(self.report_ind),
+            dtype=output_data.dtype,
+            device=output_data.device,
+        )
+
         for i, ind in enumerate(self.report_ind):
             if self.custom_norms and "specific_humidity" in self.report_features[i]:
                 q_min = self.datamodule.dataset.q_min
                 q_max = self.datamodule.dataset.q_max
+
                 o_data = denormalize_humidity(output_data[:, ind], q_min, q_max)
                 p_data = denormalize_humidity(pred_data[:, ind], q_min, q_max)
+
                 errors[i] = torch.mean((o_data - p_data) ** 2 * lat_weights)
+
             elif self.custom_norms and "precipitation" in self.report_features[i]:
                 o_data = denormalize_precipitation(output_data[:, ind])
                 p_data = denormalize_precipitation(pred_data[:, ind])
+
                 errors[i] = torch.mean((o_data - p_data) ** 2 * lat_weights)
+
             else:
                 errors[i] = torch.mean(
-                    ((output_data[:, ind] - pred_data[:, ind]) * self.report_std[i]) ** 2
+                    ((output_data[:, ind] - pred_data[:, ind]) * self.report_std[i])
+                    ** 2
                     * lat_weights
                 )
+
         return torch.sqrt(errors).detach()
 
-    def _sample_noise_emb(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Sample per-grid-point noise and return its embedding."""
-        
-        return self.model.noise_embedding.sample(
-            batch_size, self.nlat, self.nlon, device=device, dtype=dtype,
+    def _sample_raw_noise(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Sample raw per-grid-point noise.
+
+        Shape:
+            (B, noise_channels, lat, lon)
+        """
+        return torch.randn(
+            batch_size,
+            self.noise_channels,
+            self.nlat,
+            self.nlon,
+            device=device,
+            dtype=dtype,
         )
+
+    def _embed_raw_noise(self, raw_noise: torch.Tensor) -> torch.Tensor:
+        """Pass raw spatial noise through the trainable noise embedding module.
+
+        The NoiseEmbedding.forward() expects flattened noise of shape
+        (N, noise_channels), so this helper reshapes the spatial field before
+        and after applying the MLP.
+
+        Args:
+            raw_noise: (B, noise_channels, lat, lon)
+
+        Returns:
+            noise_emb: (B, emb_dim, lat, lon)
+        """
+        B, C_n, lat, lon = raw_noise.shape
+
+        noise_flat = raw_noise.permute(0, 2, 3, 1).reshape(B * lat * lon, C_n)
+        emb_flat = self.model.noise_embedding(noise_flat)
+
+        emb_dim = emb_flat.shape[-1]
+        noise_emb = emb_flat.reshape(B, lat, lon, emb_dim).permute(0, 3, 1, 2)
+
+        return noise_emb
 
     # ---------------------------------------------------------------------- #
     # Forward
     # ---------------------------------------------------------------------- #
 
-    def forward(self, x: torch.Tensor, noise_emb: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        noise_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         return self.model(x, noise_emb=noise_emb)
 
     # ---------------------------------------------------------------------- #
     # Training / validation
     # ---------------------------------------------------------------------- #
 
+    def _optimizer_and_scheduler_step(self) -> None:
+        """Manual optimisation step for ensemble mode."""
+        opt = self.optimizers()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+        sch = self.lr_schedulers()
+
+        if sch is not None:
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                pass
+            else:
+                sch.step()
+
     def training_step(self, batch, batch_idx):
         input_data, true_data = batch
         batch_size = input_data.size(0)
-        num_steps  = input_data.size(1)
-        train_loss = 0.0
-        train_fit = 0.0
-        train_spread = 0.0
+        num_steps = input_data.size(1)
 
-        if self.ensemble_mode:
-            member_inputs = [input_data.clone() for _ in range(self.num_members)]
+        # -------------------------------------------------------------- #
+        # Deterministic mode
+        # -------------------------------------------------------------- #
+        if not self.ensemble_mode:
+            train_loss = 0.0
 
-            for step in range(num_steps):
-                member_outputs = []
-                for m in range(self.num_members):
-                    # Per-grid-point noise embedding: (B, hidden_dim, lat, lon)
-                    # Each member draws independent spatial noise at every step
-                    noise_emb = self._sample_noise_emb(batch_size, input_data.device, input_data.dtype)
-                    out = self.forward(member_inputs[m][:, step], noise_emb=noise_emb)
-                    member_outputs.append(out)
-                    # Propagate this member's output into its own future input slots
-                    member_inputs[m] = self._autoregression_input_from_output(
-                        member_inputs[m], out, step, num_steps
-                    )
-
-                # afCRPS over all M members at this step
-                B, C, nlat, nlon = member_outputs[0].shape
-                members_flat = torch.stack(
-                    [o.reshape(B, -1) for o in member_outputs], dim=1
-                )                                   
-                target_flat = true_data[:, step].reshape(B, -1)
-                loss_step, fit_step, spread_step = self.crps_loss.decompose(members_flat, target_flat)
-                train_loss += loss_step
-                train_fit += fit_step
-                train_spread += spread_step
-
-        else:
-            # Deterministic forward — original behaviour
             for step in range(num_steps):
                 output_data = self.forward(input_data[:, step])
                 train_loss += self.loss_fn(output_data, true_data[:, step])
+
                 input_data = self._autoregression_input_from_output(
-                    input_data, output_data, step, num_steps
+                    input_data,
+                    output_data,
+                    step,
+                    num_steps,
                 )
 
-        batch_loss = train_loss / num_steps
-        batch_fit = train_fit / num_steps if self.ensemble_mode else torch.tensor(0.0, device=self.device)
-        batch_spread = train_spread / num_steps if self.ensemble_mode else torch.tensor(0.0, device=self.device)
+            batch_loss = train_loss / num_steps
+            self._last_train_loss_value = float(batch_loss.detach().item())
+
+            self.log(
+                "train_loss",
+                batch_loss,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                sync_dist=True,
+            )
+            self.log(
+                "lr",
+                self.trainer.optimizers[0].param_groups[0]["lr"],
+                prog_bar=True,
+            )
+            self.log(
+                "forecast_steps",
+                num_steps,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                sync_dist=True,
+            )
+
+            return batch_loss
+
+        # -------------------------------------------------------------- #
+        # Ensemble mode: memory-efficient two-member afCRPS.
+        # -------------------------------------------------------------- #
+        opt = self.optimizers()
+        opt.zero_grad(set_to_none=True)
+
+        member1_inputs = input_data.clone()
+        member2_inputs = input_data.clone()
+
+        log_loss = input_data.new_zeros(())
+        log_fit = input_data.new_zeros(())
+        log_spread = input_data.new_zeros(())
+
+        for step in range(num_steps):
+            y = true_data[:, step]
+
+            # Same raw_noise1 is reused for x1 and x1_re.
+            # The embedding MLP is applied twice, creating fresh graphs.
+            raw_noise1 = self._sample_raw_noise(
+                batch_size=batch_size,
+                device=input_data.device,
+                dtype=input_data.dtype,
+            )
+            raw_noise2 = self._sample_raw_noise(
+                batch_size=batch_size,
+                device=input_data.device,
+                dtype=input_data.dtype,
+            )
+
+            # ------------------------------
+            # 1) Member 1 fit gradient only
+            # ------------------------------
+            noise1 = self._embed_raw_noise(raw_noise1)
+            x1 = self.forward(member1_inputs[:, step], noise_emb=noise1)
+
+            loss_x1_fit = self.crps_loss.fit_term(x1, y) / num_steps
+            self.manual_backward(loss_x1_fit)
+
+            x1_det = x1.detach()
+
+            del x1
+            del loss_x1_fit
+            del noise1
+
+            # ---------------------------------------------
+            # 2) Member 2 fit + spread gradient w.r.t. x2
+            # ---------------------------------------------
+            noise2 = self._embed_raw_noise(raw_noise2)
+            x2 = self.forward(member2_inputs[:, step], noise_emb=noise2)
+
+            fit_x2 = self.crps_loss.fit_term(x2, y)
+            spread_x2 = self.crps_loss.spread_term(x1_det, x2)
+            loss_x2 = (fit_x2 - spread_x2) / num_steps
+
+            self.manual_backward(loss_x2)
+
+            x2_det = x2.detach()
+
+            del x2
+            del fit_x2
+            del spread_x2
+            del loss_x2
+            del noise2
+
+            # ------------------------------------------------------ #
+            # 3) Recompute member 1 using the same raw noise values,
+            #    but with a fresh noise-embedding graph.
+            # ------------------------------------------------------ #
+            noise1_re = self._embed_raw_noise(raw_noise1)
+            x1_re = self.forward(member1_inputs[:, step], noise_emb=noise1_re)
+
+            spread_x1 = self.crps_loss.spread_term(x1_re, x2_det)
+            loss_x1_spread = (-spread_x1) / num_steps
+
+            self.manual_backward(loss_x1_spread)
+
+            x1_re_det = x1_re.detach()
+
+            del x1_re
+            del spread_x1
+            del loss_x1_spread
+            del noise1_re
+
+            # Logging only; no graph kept.
+            with torch.no_grad():
+                step_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(
+                    x1_re_det,
+                    x2_det,
+                    y,
+                )
+                log_loss += step_loss
+                log_fit += step_fit
+                log_spread += step_spread
+
+            # Autoregressive propagation uses detached states.
+            member1_inputs = self._autoregression_input_from_output(
+                member1_inputs,
+                x1_re_det,
+                step,
+                num_steps,
+            )
+            member2_inputs = self._autoregression_input_from_output(
+                member2_inputs,
+                x2_det,
+                step,
+                num_steps,
+            )
+
+            del x1_det
+            del x2_det
+            del x1_re_det
+            del raw_noise1
+            del raw_noise2
+
+        self._optimizer_and_scheduler_step()
+
+        batch_loss = log_loss / num_steps
+        batch_fit = log_fit / num_steps
+        batch_spread = log_spread / num_steps
+
         self._last_train_loss_value = float(batch_loss.detach().item())
 
-        self.log("train_loss",     batch_loss, on_step=True,  on_epoch=False, prog_bar=True,  sync_dist=True)
-        if self.ensemble_mode:
-            self.log("train_crps_fit", batch_fit, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-            self.log("train_crps_spread", batch_spread, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-            
-        self.log("lr",             self.trainer.optimizers[0].param_groups[0]["lr"], prog_bar=True)
-        self.log("forecast_steps", num_steps,  on_step=True,  on_epoch=False, prog_bar=True,  sync_dist=True)
-        return batch_loss
+        self.log(
+            "train_loss",
+            batch_loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train_crps_fit",
+            batch_fit,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            "train_crps_spread",
+            batch_spread,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log("lr", opt.param_groups[0]["lr"], prog_bar=True)
+        self.log(
+            "forecast_steps",
+            num_steps,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+        return batch_loss.detach()
 
     def validation_step(self, batch, batch_idx):
         input_data, true_data = batch
         batch_size = input_data.size(0)
-        num_steps  = input_data.size(1)
+        num_steps = input_data.size(1)
 
-        val_loss    = 0.0
+        val_loss = 0.0
         val_fit = 0.0
         val_spread = 0.0
         report_loss = 0.0
 
         if self.ensemble_mode:
-            member_inputs = [input_data.clone() for _ in range(self.num_members)]
+            member1_inputs = input_data.clone()
+            member2_inputs = input_data.clone()
 
             for step in range(num_steps):
-                member_outputs = []
-                for m in range(self.num_members):
-                    # Per-grid-point noise embedding: (B, hidden_dim, lat, lon)
-                    noise_emb = self._sample_noise_emb(batch_size, input_data.device, input_data.dtype)
-                    out = self.forward(member_inputs[m][:, step], noise_emb=noise_emb)
-                    member_outputs.append(out)
-                    member_inputs[m] = self._autoregression_input_from_output(
-                        member_inputs[m], out, step, num_steps
-                    )
+                y = true_data[:, step]
 
-                B, C, nlat, nlon = member_outputs[0].shape
-                members_flat = torch.stack(
-                    [o.reshape(B, -1) for o in member_outputs], dim=1
+                raw_noise1 = self._sample_raw_noise(
+                    batch_size=batch_size,
+                    device=input_data.device,
+                    dtype=input_data.dtype,
                 )
-                target_flat = true_data[:, step].reshape(B, -1)
-                loss_step, fit_step, spread_step = self.crps_loss.decompose(members_flat, target_flat)
+                raw_noise2 = self._sample_raw_noise(
+                    batch_size=batch_size,
+                    device=input_data.device,
+                    dtype=input_data.dtype,
+                )
+
+                noise1 = self._embed_raw_noise(raw_noise1)
+                noise2 = self._embed_raw_noise(raw_noise2)
+
+                x1 = self.forward(member1_inputs[:, step], noise_emb=noise1)
+                x2 = self.forward(member2_inputs[:, step], noise_emb=noise2)
+
+                loss_step, fit_step, spread_step = self.crps_loss.full_loss_for_logging(
+                    x1,
+                    x2,
+                    y,
+                )
+
                 val_loss += loss_step
                 val_fit += fit_step
                 val_spread += spread_step
 
-                # RMSE report uses ensemble mean as a point estimate
-                mean_out = torch.stack(member_outputs, dim=0).mean(dim=0)
-                report_loss += self._get_report_rmse(mean_out, true_data[:, step])
+                mean_out = 0.5 * (x1 + x2)
+                report_loss += self._get_report_rmse(mean_out, y)
+
+                member1_inputs = self._autoregression_input_from_output(
+                    member1_inputs,
+                    x1.detach(),
+                    step,
+                    num_steps,
+                )
+                member2_inputs = self._autoregression_input_from_output(
+                    member2_inputs,
+                    x2.detach(),
+                    step,
+                    num_steps,
+                )
+
+                del raw_noise1
+                del raw_noise2
+                del noise1
+                del noise2
+                del x1
+                del x2
+                del mean_out
 
         else:
             for step in range(num_steps):
                 output_data = self.forward(input_data[:, step])
-                val_loss    += self.val_loss_fn(output_data, true_data[:, step])
+
+                val_loss += self.val_loss_fn(output_data, true_data[:, step])
                 report_loss += self._get_report_rmse(output_data, true_data[:, step])
-                input_data   = self._autoregression_input_from_output(
-                    input_data, output_data, step, num_steps
+
+                input_data = self._autoregression_input_from_output(
+                    input_data,
+                    output_data,
+                    step,
+                    num_steps,
                 )
 
-        self.log("val_loss", val_loss / num_steps, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        
+        self.log(
+            "val_loss",
+            val_loss / num_steps,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
         if self.ensemble_mode:
-            self.log("val_crps_fit", val_fit / num_steps, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
-            self.log("val_crps_spread", val_spread / num_steps, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log(
+                "val_crps_fit",
+                val_fit / num_steps,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            self.log(
+                "val_crps_spread",
+                val_spread / num_steps,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True,
+            )
 
         for i, name in enumerate(self.cfg.training.reports.features):
-            self.log(name, report_loss[i] / num_steps, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log(
+                name,
+                report_loss[i] / num_steps,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                sync_dist=True,
+            )
 
         return val_loss / num_steps
 
     # ---------------------------------------------------------------------- #
-    # Optimiser / scheduler (unchanged)
+    # Optimiser / scheduler
     # ---------------------------------------------------------------------- #
 
     def configure_optimizers(self):
@@ -732,11 +766,14 @@ class LitParadis(L.LightningModule):
             weight_decay=cfg.optimizer.weight_decay,
         )
 
-        enabled_schedulers = sum([
-            cfg.scheduler.one_cycle.enabled,
-            cfg.scheduler.reduce_lr.enabled,
-            cfg.scheduler.wsd.enabled,
-        ])
+        enabled_schedulers = sum(
+            [
+                cfg.scheduler.one_cycle.enabled,
+                cfg.scheduler.reduce_lr.enabled,
+                cfg.scheduler.wsd.enabled,
+            ]
+        )
+
         if enabled_schedulers != 1:
             raise ValueError(
                 f"Exactly one scheduler must be enabled, found {enabled_schedulers}."
@@ -752,9 +789,16 @@ class LitParadis(L.LightningModule):
                 final_div_factor=cfg.scheduler.one_cycle.lr_final_div,
                 anneal_strategy="cos",
             )
-            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
-        elif cfg.scheduler.reduce_lr.enabled:
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+
+        if cfg.scheduler.reduce_lr.enabled:
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
                 mode="min",
@@ -764,39 +808,69 @@ class LitParadis(L.LightningModule):
                 threshold_mode=cfg.scheduler.reduce_lr.threshold_mode,
                 min_lr=cfg.scheduler.reduce_lr.min_lr,
             )
+
             return {
                 "optimizer": optimizer,
-                "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss_epoch", "interval": "epoch", "frequency": 1},
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val_loss_epoch",
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
             }
 
-        elif cfg.scheduler.wsd.enabled:
+        if cfg.scheduler.wsd.enabled:
             total_steps = self.trainer.estimated_stepping_batches
-            warmup_steps = cfg.scheduler.wsd.warmup if cfg.scheduler.wsd.warmup >= 1 else cfg.scheduler.wsd.warmup * total_steps
-            decay_steps  = cfg.scheduler.wsd.decay  if cfg.scheduler.wsd.decay  >= 1 else cfg.scheduler.wsd.decay  * total_steps
+
+            warmup_steps = (
+                cfg.scheduler.wsd.warmup
+                if cfg.scheduler.wsd.warmup >= 1
+                else cfg.scheduler.wsd.warmup * total_steps
+            )
+            decay_steps = (
+                cfg.scheduler.wsd.decay
+                if cfg.scheduler.wsd.decay >= 1
+                else cfg.scheduler.wsd.decay * total_steps
+            )
+
             assert warmup_steps >= 0 and decay_steps >= 0
             assert warmup_steps + decay_steps <= total_steps
+
             steady_steps = total_steps - (warmup_steps + decay_steps)
 
             def lr_lambda(step):
                 if step < warmup_steps:
                     return (step + 1) / warmup_steps
-                elif step <= warmup_steps + steady_steps:
+                if step <= warmup_steps + steady_steps:
                     return 1.0
-                else:
-                    return (total_steps - step) / decay_steps
+                return (total_steps - step) / decay_steps
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+
+        raise RuntimeError("No scheduler was configured.")
 
     # ---------------------------------------------------------------------- #
-    # Callbacks (unchanged)
+    # Callbacks
     # ---------------------------------------------------------------------- #
 
     @rank_zero_only
     def on_fit_start(self):
         total = sum(p.numel() for p in self.parameters())
+
         if self.logger and hasattr(self.logger, "experiment"):
-            self.logger.experiment.add_scalar("model/num_parameters", total, global_step=0)
+            self.logger.experiment.add_scalar(
+                "model/num_parameters",
+                total,
+                global_step=0,
+            )
 
     def on_train_epoch_start(self):
         if self.print_losses:
@@ -805,10 +879,15 @@ class LitParadis(L.LightningModule):
     def on_train_epoch_end(self):
         if self.print_losses and self.epoch_start_time is not None:
             elapsed_time = time.time() - self.epoch_start_time
-            current_lr   = self.trainer.optimizers[0].param_groups[0]["lr"]
-            train_loss   = self.trainer.callback_metrics.get("train_loss")
-            val_loss     = self.trainer.callback_metrics.get("val_loss")
-            if self.trainer.is_global_zero and train_loss is not None and val_loss is not None:
+            current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+            train_loss = self.trainer.callback_metrics.get("train_loss")
+            val_loss = self.trainer.callback_metrics.get("val_loss")
+
+            if (
+                self.trainer.is_global_zero
+                and train_loss is not None
+                and val_loss is not None
+            ):
                 print(
                     f"Epoch {self.current_epoch:4d} | "
                     f"Train Loss: {train_loss.item():.6f} | "
@@ -821,51 +900,72 @@ class LitParadis(L.LightningModule):
         logging.info(f"Training completed after {self.current_epoch + 1} epochs")
 
     def on_before_optimizer_step(self, optimizer):
-        grad_sq        = defaultdict(lambda: torch.zeros((), device=self.device))
-        param_sq       = defaultdict(lambda: torch.zeros((), device=self.device))
-        momentum_sq    = defaultdict(lambda: torch.zeros((), device=self.device))
+        grad_sq = defaultdict(lambda: torch.zeros((), device=self.device))
+        param_sq = defaultdict(lambda: torch.zeros((), device=self.device))
+        momentum_sq = defaultdict(lambda: torch.zeros((), device=self.device))
         dot_product_total = defaultdict(lambda: torch.zeros((), device=self.device))
 
         for name, p in self.named_parameters():
             if p is None or p.data is None:
                 continue
+
             key = name.split(".")[1]
             param_sq[key] = param_sq[key] + (p.detach().float() ** 2).sum()
+
             if p.grad is not None:
                 g = p.grad.detach().float() if p.grad.dtype != torch.float32 else p.grad.detach()
                 grad_sq[key] = grad_sq[key] + (g ** 2).sum()
+
                 if p in optimizer.state and "exp_avg" in optimizer.state[p]:
                     m = optimizer.state[p]["exp_avg"].detach()
                     m = m.float() if m.dtype != torch.float32 else m
+
                     dot_product_total[key] = dot_product_total[key] + (g * m).sum()
-                    momentum_sq[key]       = momentum_sq[key] + (m ** 2).sum()
+                    momentum_sq[key] = momentum_sq[key] + (m ** 2).sum()
 
         total_grad = torch.stack(
             list(grad_sq.values()) or [torch.zeros((), device=self.device)]
         ).sum().sqrt()
 
         metrics = {"grad/total": total_grad}
+
         eps = 1e-12
-        total_dot = total_grad_sq = total_momentum_sq = torch.zeros((), device=self.device)
+        total_dot = torch.zeros((), device=self.device)
+        total_grad_sq = torch.zeros((), device=self.device)
+        total_momentum_sq = torch.zeros((), device=self.device)
 
         for k in sorted(grad_sq.keys()):
             gnorm = grad_sq[k].sqrt()
             pnorm = param_sq[k].sqrt().clamp_min(eps)
-            metrics[f"grad/{k}"]      = gnorm
+
+            metrics[f"grad/{k}"] = gnorm
             metrics[f"gradratio/{k}"] = gnorm / pnorm
-            metrics[f"pnorm/{k}"]     = pnorm
+            metrics[f"pnorm/{k}"] = pnorm
+
             if momentum_sq[k] > 0:
-                per_layer_alignment = dot_product_total[k] / (gnorm * momentum_sq[k].sqrt() + eps)
+                per_layer_alignment = dot_product_total[k] / (
+                    gnorm * momentum_sq[k].sqrt() + eps
+                )
                 metrics[f"grad_alignment/{k}"] = per_layer_alignment
-            total_dot         = total_dot         + dot_product_total[k]
-            total_grad_sq     = total_grad_sq     + grad_sq[k]
+
+            total_dot = total_dot + dot_product_total[k]
+            total_grad_sq = total_grad_sq + grad_sq[k]
             total_momentum_sq = total_momentum_sq + momentum_sq[k]
 
         if total_momentum_sq > 0:
-            total_alignment = total_dot / (total_grad_sq.sqrt() * total_momentum_sq.sqrt() + eps)
+            total_alignment = total_dot / (
+                total_grad_sq.sqrt() * total_momentum_sq.sqrt() + eps
+            )
             metrics["grad_alignment/total"] = total_alignment
 
-        self.log_dict(metrics, on_step=True, logger=True, prog_bar=False, sync_dist=True)
+        self.log_dict(
+            metrics,
+            on_step=True,
+            logger=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
+
         return super().on_before_optimizer_step(optimizer)
 
     def on_train_batch_start(self, batch, batch_idx):
@@ -877,8 +977,11 @@ class LitParadis(L.LightningModule):
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+
         toc = datetime.datetime.now()
-        dt  = (toc - self.tic).total_seconds()
-        self.log("dt",     dt,          on_step=True)
+        dt = (toc - self.tic).total_seconds()
+
+        self.log("dt", dt, on_step=True)
+
         self.min_dt = min(dt, self.min_dt)
         self.log("min_dt", self.min_dt, on_step=True)

@@ -1,6 +1,7 @@
 import sys
 from datetime import datetime
 import logging
+import random
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -19,6 +20,22 @@ from utils.postprocessing import (
 from utils.visualization import plot_forecast_map
 
 
+def set_forecast_seed(seed: int) -> None:
+    """Set random seeds for reproducible forecasting."""
+    random.seed(seed)
+    numpy.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # These make CUDA operations more reproducible.
+    # They may slightly reduce performance.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
 def main():
     """Generate forecasts using a trained model.
     Usage: python forecast.py path/to/config_file.yaml
@@ -26,12 +43,20 @@ def main():
 
     cfg = OmegaConf.load(sys.argv[1])
 
+    # ------------------------------------------------------------
+    # Reproducibility
+    # ------------------------------------------------------------
+    seed = cfg.init.get("seed", 42)
+    set_forecast_seed(seed)
+    logging.info(f"Forecast random seed set to {seed}")
+
     """
     Core forecast execution logic.
 
     Args:
         cfg: Fully configured DictConfig with all necessary parameters set
     """
+
     # Set device
     device = torch.device(
         "cuda"
@@ -57,9 +82,9 @@ def main():
     num_forecast_steps = cfg.model.forecast_steps
 
     # Ensemble configuration — mirrors LitParadis setup
-    noise_channels  = cfg.model.get("noise_channels", 0)
-    ensemble_mode   = noise_channels > 0
-    num_members     = cfg.training.get("num_ensemble_members", 4) if ensemble_mode else 1
+    noise_channels = cfg.model.get("noise_channels", 0)
+    ensemble_mode = noise_channels > 0
+    num_members = cfg.training.get("num_ensemble_members", 4) if ensemble_mode else 1
 
     # Get the output number of forecast steps based on the output frequency
     output_frequency = cfg.forecast.output_frequency
@@ -100,16 +125,19 @@ def main():
     logging.info(f"Number of forecasts to generate: {len(init_times)}")
     if ensemble_mode:
         logging.info(f"Ensemble mode: {num_members} members")
+        logging.info(
+            "Using one global forecast seed. Members receive different fresh "
+            "noise samples from the same seeded RNG stream."
+        )
 
     # Run forecast
     logging.info("Generating forecast...")
     ind = 0
+
     with torch.inference_mode(), torch.no_grad():
         time_start_ind = 0
-        for input_data, ground_truth in tqdm(
-            datamodule.predict_dataloader()
-        ):
 
+        for input_data, ground_truth in tqdm(datamodule.predict_dataloader()):
             batch_size = input_data.shape[0]
 
             if ensemble_mode:
@@ -130,29 +158,21 @@ def main():
 
                 for m in range(num_members):
                     frequency_counter = 0
+
                     for step in range(num_forecast_steps):
-                        # model.forward() auto-samples per-grid-point noise when
-                        # noise_emb is not provided — each member call gets fresh noise
+                        # noise_emb is not provided here.
+                        # Therefore, Paradis.forward() auto-samples fresh
+                        # per-grid-point noise. Since the global RNG seed was
+                        # set at the beginning, the full ensemble is reproducible.
                         output_data = litmodel(
                             member_inputs[m][:, step].to(device),
                         )
-                        
-                        # zero_noise_emb = torch.zeros(
-                        #     batch_size,
-                        #     litmodel.model.hidden_dim,
-                        #     litmodel.nlat,
-                        #     litmodel.nlon,
-                        #     device=device,
-                        #     dtype=member_inputs[m].dtype,
-                        # )
-                        
-                        # output_data = litmodel(
-                        #     member_inputs[m][:, step].to(device),
-                        #     noise_emb=zero_noise_emb, 
-                        # )
-                        
+
                         member_inputs[m] = litmodel._autoregression_input_from_output(
-                            member_inputs[m], output_data, step, num_forecast_steps
+                            member_inputs[m],
+                            output_data,
+                            step,
+                            num_forecast_steps,
                         )
 
                         if step % cfg.forecast.output_frequency == 0:
@@ -160,30 +180,36 @@ def main():
                             frequency_counter += 1
 
                 # Transfer to CPU: (B, M, output_steps, F, lat, lon)
-                # output_forecast = output_forecast.cpu()
                 output_forecast = output_forecast.cpu()
 
                 # Denormalize each member independently
                 for m in range(num_members):
-                    denormalize_datasets(ground_truth, output_forecast[:, m], dataset)
+                    denormalize_datasets(
+                        ground_truth,
+                        output_forecast[:, m],
+                        dataset,
+                    )
 
                 output_forecast = output_forecast.numpy().astype(numpy.float64)
                 ground_truth_np = ground_truth.numpy().astype(numpy.float64)
+
                 # Post-process winds for each member
                 for m in range(num_members):
                     convert_cartesian_to_spherical_winds(
-                        dataset.lat, dataset.lon, cfg, ground_truth_np, output_features
-                    )
-                    # convert_cartesian_to_spherical_winds(
-                    #     dataset.lat, dataset.lon, cfg, output_forecast[:, m].numpy(), output_features
-                    # )
-                    convert_cartesian_to_spherical_winds(
-                        dataset.lat, dataset.lon, cfg,
-                        numpy.ascontiguousarray(output_forecast[:, m]),
-                        output_features
+                        dataset.lat,
+                        dataset.lon,
+                        cfg,
+                        ground_truth_np,
+                        output_features,
                     )
 
-                # output_forecast = output_forecast.numpy()
+                    convert_cartesian_to_spherical_winds(
+                        dataset.lat,
+                        dataset.lon,
+                        cfg,
+                        numpy.ascontiguousarray(output_forecast[:, m]),
+                        output_features,
+                    )
 
             else:
                 # Deterministic forecast
@@ -199,13 +225,17 @@ def main():
                 )
 
                 frequency_counter = 0
+
                 for step in range(num_forecast_steps):
                     output_data = litmodel(
                         input_data[:, step].to(device),
                     )
 
                     input_data = litmodel._autoregression_input_from_output(
-                        input_data, output_data, step, num_forecast_steps
+                        input_data,
+                        output_data,
+                        step,
+                        num_forecast_steps,
                     )
 
                     if step % cfg.forecast.output_frequency == 0:
@@ -217,10 +247,18 @@ def main():
                 output_forecast = output_forecast.numpy()
 
                 convert_cartesian_to_spherical_winds(
-                    dataset.lat, dataset.lon, cfg, ground_truth, output_features
+                    dataset.lat,
+                    dataset.lon,
+                    cfg,
+                    ground_truth,
+                    output_features,
                 )
                 convert_cartesian_to_spherical_winds(
-                    dataset.lat, dataset.lon, cfg, output_forecast, output_features
+                    dataset.lat,
+                    dataset.lon,
+                    cfg,
+                    output_forecast,
+                    output_features,
                 )
 
             # Save results
@@ -242,7 +280,7 @@ def main():
             ind += 1
             time_start_ind += batch_size
 
-    logging.info("Saved output files successfuly")
+    logging.info("Saved output files successfully")
 
 
 if __name__ == "__main__":

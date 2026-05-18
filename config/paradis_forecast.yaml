@@ -1,7 +1,7 @@
 model:
   latent_multiplier: -1
   latent_size: 1024
-  forecast_steps: 3
+  forecast_steps: 40
   base_dt: 21600
   num_layers: 8
   bias_channels: 4
@@ -15,9 +15,8 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_77/checkpoints/step=step=0022500.ckpt
-  restart: true
-  checkpoint_type: ensemble   # deterministic or ensemble
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_76/checkpoints/step=step=0060000.ckpt
+  restart: false
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
   time_resolution: 6h
@@ -27,33 +26,33 @@ dataset:
 normalization:
   standard: true
 compute:
-  num_nodes: 1
-  num_devices: 1
+  num_nodes: 2
+  num_devices: 4
   accelerator: gpu
   use_amp: true
   batch_size: 1
   num_workers: 1
   compile: true
 forecast:
-  enable: false
-  start_date: '2022-01-01'
-  end_date: '2022-06-30'
+  enable: true
+  start_date: '2022-06-01'
+  end_date: '2022-08-31'
   output_frequency: 1
-  output_file: ./results/FT_LT72h_with_24hrWeights_2022.zarr/
+  output_file: ./results/onedeg_2022_borealSummer_12hrsWeight.zarr/
 training:
   max_epochs: -1
-  max_steps: 45000
+  max_steps: 300000
   progress_bar: true
   gradient_clip_val: null
   print_losses: false
   log_every_n_steps: 100
   log_dir: logs
   experiment_name: null
-  num_ensemble_members: 2
+  num_ensemble_members: 4
   crps_alpha: 0.95
   dataset:
-    start_date: '1990-01-01'
-    end_date: '2019-12-31'
+    start_date: '2000-01-01'
+    end_date: '2017-12-31'
     preload: false
   validation_dataset:
     start_date: '2020-01-01'
@@ -62,7 +61,7 @@ training:
     validation_every_n_steps: null
     validation_batches: null
   optimizer:
-    lr: 0.000001
+    lr: 0.0001
     weight_decay: 0.01
     beta1: 0.9
     beta2: 0.95
@@ -91,7 +90,7 @@ training:
       min_lr: 1.0e-07
     wsd:
       enabled: true
-      warmup: 500
+      warmup: 100
       decay: 0.2
   variable_loss_weights:
     atmospheric:
@@ -108,6 +107,8 @@ training:
       wind_z_10m: 1.0
       2m_temperature: 1.0
       mean_sea_level_pressure: 1.0
+      surface_pressure: 1.0
+      total_column_water: 1.0
   reports:
     enable: true
     features:
@@ -142,7 +143,6 @@ features:
     - wind_z_10m
     - 2m_temperature
     - mean_sea_level_pressure
-   
   input:
     atmospheric: ${features.base.atmospheric}
     surface: ${features.base.surface}

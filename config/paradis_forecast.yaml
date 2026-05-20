@@ -35,10 +35,10 @@ compute:
   compile: true
 forecast:
   enable: true
-  start_date: '2022-06-01'
-  end_date: '2022-08-31'
+  start_date: '2022-07-01'
+  end_date: '2022-07-31'
   output_frequency: 1
-  output_file: ./results/onedeg_2022_borealSummer_12hrsWeight.zarr/
+  output_file: ./results/onedeg_2022_borealSummer_72hrsWeight_july_2steps.zarr/
 training:
   max_epochs: -1
   max_steps: 300000
@@ -48,7 +48,7 @@ training:
   log_every_n_steps: 100
   log_dir: logs
   experiment_name: null
-  num_ensemble_members: 4
+  num_ensemble_members: 20
   crps_alpha: 0.95
   dataset:
     start_date: '2000-01-01'

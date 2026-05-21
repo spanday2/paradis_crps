@@ -27,7 +27,6 @@ def save_results_to_zarr(
                        In ensemble mode:      (B, M, output_steps, F, lat, lon)
         ensemble_mode: If True, data has an extra member dimension (M) and
                        a 'member' coordinate is added to the output dataset.
-        All other args unchanged from the original.
     """
     data_vars = {}
     num_levels = len(pressure_levels)
@@ -39,21 +38,38 @@ def save_results_to_zarr(
         num_members = data.shape[1]
 
         # Atmospheric variables — add member dim
-        # input_data has no member dim so we broadcast it across all members
         # final shape per var: (B, M, output_steps+1, levels, lat, lon)
-        atm_dims = ["time", "member", "prediction_timedelta", "level", "latitude", "longitude"]
+        atm_dims = [
+            "time",
+            "member",
+            "prediction_timedelta",
+            "level",
+            "latitude",
+            "longitude",
+        ]
+
         for i, feature in enumerate(atmospheric_vars):
             beg_ind = i * num_levels
             end_ind = (i + 1) * num_levels
 
-            # input slice: (B, 1, levels, lat, lon) — broadcast across members
+            # input_data original layout appears to be:
+            # (B, lat, lon, F)
+            #
+            # input slice:
+            # input_data[..., beg_ind:end_ind] -> (B, lat, lon, level)
+            # transpose -> (B, level, lat, lon)
+            # add member and prediction_timedelta dims -> (B, 1, 1, level, lat, lon)
+            # repeat over members -> (B, M, 1, level, lat, lon)
             input_slice = (
                 input_data[..., beg_ind:end_ind]
-                .transpose(0, 3, 1, 2)[:, None, None]         # (B, 1, 1, levels, lat, lon)
-                .repeat(num_members, axis=1)                   # (B, M, 1, levels, lat, lon)
+                .transpose(0, 3, 1, 2)[:, None, None]
+                .repeat(num_members, axis=1)
             )
-            # forecast slice: (B, M, output_steps, levels, lat, lon)
-            forecast_slice = data[:, :, :, beg_ind:end_ind]   # (B, M, steps, lat, lon, levels)
+
+            # forecast slice:
+            # data[:, :, :, beg_ind:end_ind] should be
+            # (B, M, steps, level, lat, lon)
+            forecast_slice = data[:, :, :, beg_ind:end_ind]
 
             data_vars[feature] = (
                 atm_dims,
@@ -62,17 +78,26 @@ def save_results_to_zarr(
 
         # Surface variables — add member dim
         # final shape per var: (B, M, output_steps+1, lat, lon)
-        sur_dims = ["time", "member", "prediction_timedelta", "latitude", "longitude"]
+        sur_dims = [
+            "time",
+            "member",
+            "prediction_timedelta",
+            "latitude",
+            "longitude",
+        ]
+
         for i, feature in enumerate(surface_vars):
             if feature == "wind_z_10m":
                 continue
+
             feat_idx = len(atmospheric_vars) * num_levels + i
 
-            # input slice: (B, 1, 1, lat, lon) → broadcast across members
+            # input slice: (B, 1, 1, lat, lon), repeated over members
             input_slice = (
-                input_data[..., feat_idx][:, None, None]       # (B, 1, 1, lat, lon)
-                .repeat(num_members, axis=1)                   # (B, M, 1, lat, lon)
+                input_data[..., feat_idx][:, None, None]
+                .repeat(num_members, axis=1)
             )
+
             # forecast slice: (B, M, output_steps, lat, lon)
             forecast_slice = data[:, :, :, feat_idx]
 
@@ -87,7 +112,14 @@ def save_results_to_zarr(
         # Deterministic — original behaviour unchanged
         # data shape: (B, output_steps, F, lat, lon)
 
-        atm_dims = ["time", "prediction_timedelta", "level", "latitude", "longitude"]
+        atm_dims = [
+            "time",
+            "prediction_timedelta",
+            "level",
+            "latitude",
+            "longitude",
+        ]
+
         for i, feature in enumerate(atmospheric_vars):
             beg_ind = i * num_levels
             end_ind = (i + 1) * num_levels
@@ -96,23 +128,33 @@ def save_results_to_zarr(
                 atm_dims,
                 numpy.concatenate(
                     (
-                        input_data[..., beg_ind:end_ind].transpose(0, 3, 1, 2)[:, None],
+                        input_data[..., beg_ind:end_ind]
+                        .transpose(0, 3, 1, 2)[:, None],
                         data[:, :, beg_ind:end_ind],
                     ),
                     axis=1,
                 ),
             )
 
-        sur_dims = ["time", "prediction_timedelta", "latitude", "longitude"]
+        sur_dims = [
+            "time",
+            "prediction_timedelta",
+            "latitude",
+            "longitude",
+        ]
+
         for i, feature in enumerate(surface_vars):
             if feature == "wind_z_10m":
                 continue
+
+            feat_idx = len(atmospheric_vars) * num_levels + i
+
             data_vars[feature] = (
                 sur_dims,
                 numpy.concatenate(
                     (
-                        input_data[..., len(atmospheric_vars) * num_levels + i][:, None],
-                        data[:, :, len(atmospheric_vars) * num_levels + i],
+                        input_data[..., feat_idx][:, None],
+                        data[:, :, feat_idx],
                     ),
                     axis=1,
                 ),
@@ -123,10 +165,15 @@ def save_results_to_zarr(
     if ind == 0:
         # Constant variables — no member dim, same in both modes
         con_dims = ["latitude", "longitude"]
+
         for i, feature in enumerate(dataset.ds_constants.data_vars):
             if feature in con_dims:
                 continue
-            data_vars[feature] = (con_dims, dataset.ds_constants[feature].data)
+
+            data_vars[feature] = (
+                con_dims,
+                dataset.ds_constants[feature].data,
+            )
 
     # Number of output steps depends on mode
     num_output_steps = data.shape[2] if ensemble_mode else data.shape[1]
@@ -137,8 +184,10 @@ def save_results_to_zarr(
         "longitude": dataset.lon,
         "time": init_times,
         "level": pressure_levels,
-        "prediction_timedelta": (numpy.arange(num_output_steps + 1))
-        * numpy.timedelta64(6 * 3600 * 10**9, "ns"),
+        "prediction_timedelta": (
+            numpy.arange(num_output_steps + 1)
+            * numpy.timedelta64(6 * 3600 * 10**9, "ns")
+        ),
         **coords_extra,
     }
 
@@ -155,6 +204,33 @@ def save_results_to_zarr(
     ps = ds.level * 100
     ds = ds.assign(dewpoint_depression=mhuaes3(hu, tt, ps))
 
+    def get_zarr_chunks(da):
+        chunks = []
+
+        for dim in da.dims:
+            if dim == "time":
+                chunks.append(1)
+
+            elif dim == "member":
+                chunks.append(1)
+
+            elif dim == "prediction_timedelta":
+                chunks.append(1)
+
+            elif dim == "level":
+                chunks.append(da.sizes[dim])
+
+            elif dim == "latitude":
+                chunks.append(da.sizes[dim])
+
+            elif dim == "longitude":
+                chunks.append(da.sizes[dim])
+
+            else:
+                chunks.append(da.sizes[dim])
+
+        return tuple(chunks)
+
     with dask.config.set(scheduler="threads"):
 
         if ind == 0:
@@ -163,14 +239,9 @@ def save_results_to_zarr(
             }
 
             for var in ds.data_vars:
-                if "time" in ds[var].dims:
-                    var_shape = ds[var].shape
-                    encoding[var] = {
-                        "chunks": (
-                            1,
-                            *var_shape[1:],
-                        ),
-                    }
+                encoding[var] = {
+                    "chunks": get_zarr_chunks(ds[var]),
+                }
 
             ds.to_zarr(
                 filename,
@@ -178,6 +249,7 @@ def save_results_to_zarr(
                 zarr_format=2,
                 encoding=encoding,
             )
+
         else:
             ds.to_zarr(
                 filename,

@@ -46,7 +46,7 @@ def main():
     # ------------------------------------------------------------
     # Reproducibility
     # ------------------------------------------------------------
-    seed = cfg.init.get("seed", 42)
+    seed = cfg.init.get("seed", 43)
     set_forecast_seed(seed)
     logging.info(f"Forecast random seed set to {seed}")
 

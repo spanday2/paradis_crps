@@ -15,7 +15,7 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_76/checkpoints/step=step=0060000.ckpt
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_79/checkpoints/step=step=0003500.ckpt
   restart: false
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
@@ -38,7 +38,7 @@ forecast:
   start_date: '2022-07-01'
   end_date: '2022-07-31'
   output_frequency: 1
-  output_file: ./results/onedeg_2022_borealSummer_72hrsWeight_july_2steps.zarr/
+  output_file: ./results/onedeg_2022_30hrWeight_july_43.zarr/
 training:
   max_epochs: -1
   max_steps: 300000
@@ -48,7 +48,7 @@ training:
   log_every_n_steps: 100
   log_dir: logs
   experiment_name: null
-  num_ensemble_members: 20
+  num_ensemble_members: 10
   crps_alpha: 0.95
   dataset:
     start_date: '2000-01-01'

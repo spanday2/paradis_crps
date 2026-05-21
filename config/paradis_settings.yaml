@@ -15,7 +15,7 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_77/checkpoints/step=step=0022500.ckpt
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_77/checkpoints/0003500.ckpt
   restart: false
   checkpoint_type: ensemble   # deterministic or ensemble
 dataset:
@@ -75,7 +75,7 @@ training:
     lat_weights: true
     validation_loss: null
   checkpointing:
-    enabled: true
+    enabled: false
   scheduler:
     one_cycle:
       enabled: false

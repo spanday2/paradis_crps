@@ -9,7 +9,6 @@ from collections import defaultdict
 import lightning as L
 import omegaconf.dictconfig
 import torch
-import torch.nn as nn
 import torch.distributed as dist
 from lightning.pytorch.utilities import rank_zero_only
 
@@ -17,6 +16,11 @@ from data.datamodule import Era5DataModule
 from model.paradis import Paradis
 from utils.loss import ParadisLoss
 from utils.normalization import denormalize_humidity, denormalize_precipitation
+from utils.crps_loss import (
+    TwoMemberAlmostFairCRPS,
+    two_member_afcrps_training_step,
+    two_member_afcrps_validation_step,
+)
 
 
 def _allreduce_scalar(x: torch.Tensor, op: str):
@@ -34,58 +38,6 @@ def _allreduce_scalar(x: torch.Tensor, op: str):
         y /= dist.get_world_size()
 
     return y
-
-
-class TwoMemberAlmostFairCRPS(nn.Module):
-    """Memory-efficient two-member almost-fair CRPS utilities.
-
-    For two members, the loss is
-
-        0.5 * |x1 - y| + 0.5 * |x2 - y| - 0.5 * C * |x1 - x2|
-
-    where, matching the previous AlmostFairCRPS implementation,
-
-        eps = (1 - alpha) / 2
-        C   = 1 - eps
-
-    If alpha=1, this becomes the fair two-member coefficient C=1.
-    If the standard unfair CRPS coefficient for M=2 is desired, set
-    training.crps_pairwise_coeff = 0.5 in the config.
-    """
-
-    def __init__(self, alpha: float = 0.95, pairwise_coeff: float | None = None):
-        super().__init__()
-        self.alpha = alpha
-        self.pairwise_coeff = pairwise_coeff
-
-    @property
-    def c(self) -> float:
-        if self.pairwise_coeff is not None:
-            return float(self.pairwise_coeff)
-
-        eps = (1.0 - float(self.alpha)) / 2.0
-        return 1.0 - eps
-
-    @staticmethod
-    def _mean_abs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.mean(torch.abs(a - b))
-
-    def fit_term(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self._mean_abs(x, y)
-
-    def spread_term(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self.c * self._mean_abs(x1, x2)
-
-    def full_loss_for_logging(
-        self,
-        x1: torch.Tensor,
-        x2: torch.Tensor,
-        y: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        fit = self.fit_term(x1, y) + self.fit_term(x2, y)
-        spread = self.spread_term(x1, x2)
-        loss = fit - spread
-        return loss, fit, spread
 
 
 class LitParadis(L.LightningModule):
@@ -124,14 +76,6 @@ class LitParadis(L.LightningModule):
         self.nlat = lat_grid.shape[0]
         self.nlon = lat_grid.shape[1]
 
-        # if self.ensemble_mode and self.num_members != 2:
-        #     raise ValueError(
-        #         "The memory-efficient streaming afCRPS trainer is implemented only "
-        #         f"for two members, but got num_ensemble_members={self.num_members}."
-        #     )
-
-        # if self.ensemble_mode:
-        #     self.automatic_optimization = False
         if self.ensemble_mode and not cfg.forecast.enable:
             if self.num_members != 2:
                 raise ValueError(
@@ -275,7 +219,9 @@ class LitParadis(L.LightningModule):
                 weights_only=True,
                 map_location="cpu",
             )
-            state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+            state_dict = (
+                checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+            )
             self.load_state_dict(state_dict, strict=True)
 
         if not cfg.forecast.enable and cfg.training.reports.enable:
@@ -426,7 +372,6 @@ class LitParadis(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         input_data, true_data = batch
-        batch_size = input_data.size(0)
         num_steps = input_data.size(1)
 
         # -------------------------------------------------------------- #
@@ -475,125 +420,17 @@ class LitParadis(L.LightningModule):
 
         # -------------------------------------------------------------- #
         # Ensemble mode: memory-efficient two-member afCRPS.
+        # Heavy CRPS logic is implemented in utils/crps_loss.py.
         # -------------------------------------------------------------- #
-        opt = self.optimizers()
-        opt.zero_grad(set_to_none=True)
-
-        member1_inputs = input_data.clone()
-        member2_inputs = input_data.clone()
-
-        log_loss = input_data.new_zeros(())
-        log_fit = input_data.new_zeros(())
-        log_spread = input_data.new_zeros(())
-
-        for step in range(num_steps):
-            y = true_data[:, step]
-
-            # Same raw_noise1 is reused for x1 and x1_re.
-            # The embedding MLP is applied twice, creating fresh graphs.
-            raw_noise1 = self._sample_raw_noise(
-                batch_size=batch_size,
-                device=input_data.device,
-                dtype=input_data.dtype,
-            )
-            raw_noise2 = self._sample_raw_noise(
-                batch_size=batch_size,
-                device=input_data.device,
-                dtype=input_data.dtype,
-            )
-
-            # ------------------------------
-            # 1) Member 1 fit gradient only
-            # ------------------------------
-            noise1 = self._embed_raw_noise(raw_noise1)
-            x1 = self.forward(member1_inputs[:, step], noise_emb=noise1)
-
-            loss_x1_fit = self.crps_loss.fit_term(x1, y) / num_steps
-            self.manual_backward(loss_x1_fit)
-
-            x1_det = x1.detach()
-
-            del x1
-            del loss_x1_fit
-            del noise1
-
-            # ---------------------------------------------
-            # 2) Member 2 fit + spread gradient w.r.t. x2
-            # ---------------------------------------------
-            noise2 = self._embed_raw_noise(raw_noise2)
-            x2 = self.forward(member2_inputs[:, step], noise_emb=noise2)
-
-            fit_x2 = self.crps_loss.fit_term(x2, y)
-            spread_x2 = self.crps_loss.spread_term(x1_det, x2)
-            loss_x2 = (fit_x2 - spread_x2) / num_steps
-
-            self.manual_backward(loss_x2)
-
-            x2_det = x2.detach()
-
-            del x2
-            del fit_x2
-            del spread_x2
-            del loss_x2
-            del noise2
-
-            # ------------------------------------------------------ #
-            # 3) Recompute member 1 using the same raw noise values,
-            #    but with a fresh noise-embedding graph.
-            # ------------------------------------------------------ #
-            noise1_re = self._embed_raw_noise(raw_noise1)
-            x1_re = self.forward(member1_inputs[:, step], noise_emb=noise1_re)
-
-            spread_x1 = self.crps_loss.spread_term(x1_re, x2_det)
-            loss_x1_spread = (-spread_x1) / num_steps
-
-            self.manual_backward(loss_x1_spread)
-
-            x1_re_det = x1_re.detach()
-
-            del x1_re
-            del spread_x1
-            del loss_x1_spread
-            del noise1_re
-
-            # Logging only; no graph kept.
-            with torch.no_grad():
-                step_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(
-                    x1_re_det,
-                    x2_det,
-                    y,
-                )
-                log_loss += step_loss
-                log_fit += step_fit
-                log_spread += step_spread
-
-            # Autoregressive propagation uses detached states.
-            member1_inputs = self._autoregression_input_from_output(
-                member1_inputs,
-                x1_re_det,
-                step,
-                num_steps,
-            )
-            member2_inputs = self._autoregression_input_from_output(
-                member2_inputs,
-                x2_det,
-                step,
-                num_steps,
-            )
-
-            del x1_det
-            del x2_det
-            del x1_re_det
-            del raw_noise1
-            del raw_noise2
-
-        self._optimizer_and_scheduler_step()
-
-        batch_loss = log_loss / num_steps
-        batch_fit = log_fit / num_steps
-        batch_spread = log_spread / num_steps
+        batch_loss, batch_fit, batch_spread = two_member_afcrps_training_step(
+            self,
+            input_data,
+            true_data,
+        )
 
         self._last_train_loss_value = float(batch_loss.detach().item())
+
+        opt = self.optimizers()
 
         self.log(
             "train_loss",
@@ -633,73 +470,32 @@ class LitParadis(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         input_data, true_data = batch
-        batch_size = input_data.size(0)
         num_steps = input_data.size(1)
 
-        val_loss = 0.0
-        val_fit = 0.0
-        val_spread = 0.0
-        report_loss = 0.0
-
+        # -------------------------------------------------------------- #
+        # Ensemble mode
+        # -------------------------------------------------------------- #
         if self.ensemble_mode:
-            member1_inputs = input_data.clone()
-            member2_inputs = input_data.clone()
-
-            for step in range(num_steps):
-                y = true_data[:, step]
-
-                raw_noise1 = self._sample_raw_noise(
-                    batch_size=batch_size,
-                    device=input_data.device,
-                    dtype=input_data.dtype,
+            val_loss, val_fit, val_spread, report_loss = (
+                two_member_afcrps_validation_step(
+                    self,
+                    input_data,
+                    true_data,
                 )
-                raw_noise2 = self._sample_raw_noise(
-                    batch_size=batch_size,
-                    device=input_data.device,
-                    dtype=input_data.dtype,
-                )
+            )
 
-                noise1 = self._embed_raw_noise(raw_noise1)
-                noise2 = self._embed_raw_noise(raw_noise2)
-
-                x1 = self.forward(member1_inputs[:, step], noise_emb=noise1)
-                x2 = self.forward(member2_inputs[:, step], noise_emb=noise2)
-
-                loss_step, fit_step, spread_step = self.crps_loss.full_loss_for_logging(
-                    x1,
-                    x2,
-                    y,
-                )
-
-                val_loss += loss_step
-                val_fit += fit_step
-                val_spread += spread_step
-
-                mean_out = 0.5 * (x1 + x2)
-                report_loss += self._get_report_rmse(mean_out, y)
-
-                member1_inputs = self._autoregression_input_from_output(
-                    member1_inputs,
-                    x1.detach(),
-                    step,
-                    num_steps,
-                )
-                member2_inputs = self._autoregression_input_from_output(
-                    member2_inputs,
-                    x2.detach(),
-                    step,
-                    num_steps,
-                )
-
-                del raw_noise1
-                del raw_noise2
-                del noise1
-                del noise2
-                del x1
-                del x2
-                del mean_out
-
+        # -------------------------------------------------------------- #
+        # Deterministic mode
+        # -------------------------------------------------------------- #
         else:
+            val_loss = input_data.new_zeros(())
+
+            report_loss = torch.zeros(
+                len(self.report_ind),
+                dtype=input_data.dtype,
+                device=input_data.device,
+            )
+
             for step in range(num_steps):
                 output_data = self.forward(input_data[:, step])
 
@@ -913,7 +709,11 @@ class LitParadis(L.LightningModule):
             param_sq[key] = param_sq[key] + (p.detach().float() ** 2).sum()
 
             if p.grad is not None:
-                g = p.grad.detach().float() if p.grad.dtype != torch.float32 else p.grad.detach()
+                g = (
+                    p.grad.detach().float()
+                    if p.grad.dtype != torch.float32
+                    else p.grad.detach()
+                )
                 grad_sq[key] = grad_sq[key] + (g ** 2).sum()
 
                 if p in optimizer.state and "exp_avg" in optimizer.state[p]:

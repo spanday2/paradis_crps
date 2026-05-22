@@ -21,6 +21,7 @@ from utils.crps_loss import (
     two_member_afcrps_training_step,
     two_member_afcrps_validation_step,
 )
+from utils.checkpointing import load_checkpoint_for_litmodel
 
 
 def _allreduce_scalar(x: torch.Tensor, op: str):
@@ -205,6 +206,13 @@ class LitParadis(L.LightningModule):
         self.num_common_features = datamodule.num_common_features
         self.print_losses = cfg.training.print_losses
 
+        # ------------------------------------------------------------------ #
+        # Checkpoint loading / initialization
+        # ------------------------------------------------------------------ #
+        if (cfg.init.checkpoint_path and not cfg.init.restart) or cfg.forecast.enable:
+            load_checkpoint_for_litmodel(self, cfg)
+
+        # Compile after loading weights
         if cfg.compute.compile:
             self.model.compile(
                 mode="default",
@@ -212,17 +220,6 @@ class LitParadis(L.LightningModule):
                 dynamic=False,
                 backend="inductor",
             )
-
-        if (cfg.init.checkpoint_path and not cfg.init.restart) or cfg.forecast.enable:
-            checkpoint = torch.load(
-                cfg.init.checkpoint_path,
-                weights_only=True,
-                map_location="cpu",
-            )
-            state_dict = (
-                checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-            )
-            self.load_state_dict(state_dict, strict=True)
 
         if not cfg.forecast.enable and cfg.training.reports.enable:
             self.report_features = cfg.training.reports.features

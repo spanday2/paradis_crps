@@ -21,7 +21,10 @@ from utils.crps_loss import (
     two_member_afcrps_training_step,
     two_member_afcrps_validation_step,
 )
-from utils.checkpointing import load_checkpoint_for_litmodel
+from utils.checkpointing import (
+    load_checkpoint_for_litmodel,
+    maybe_update_backbone_lr_after_catchup
+)
 
 
 def _allreduce_scalar(x: torch.Tensor, op: str):
@@ -39,6 +42,18 @@ def _allreduce_scalar(x: torch.Tensor, op: str):
         y /= dist.get_world_size()
 
     return y
+
+def _is_conditioning_parameter(name: str) -> bool:
+    """Return True for ensemble-conditioning parameters."""
+
+    conditioning_keywords = [
+        "noise_embedding",
+        "cond_norm",
+        "noise_scale",
+        "noise_bias",
+    ]
+
+    return any(keyword in name for keyword in conditioning_keywords)
 
 
 class LitParadis(L.LightningModule):
@@ -370,6 +385,8 @@ class LitParadis(L.LightningModule):
     def training_step(self, batch, batch_idx):
         input_data, true_data = batch
         num_steps = input_data.size(1)
+        
+        maybe_update_backbone_lr_after_catchup(self)
 
         # -------------------------------------------------------------- #
         # Deterministic mode
@@ -552,13 +569,53 @@ class LitParadis(L.LightningModule):
     def configure_optimizers(self):
         cfg = self.cfg.training
 
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            betas=(cfg.optimizer.beta1, cfg.optimizer.beta2),
-            lr=cfg.optimizer.lr,
-            weight_decay=cfg.optimizer.weight_decay,
-        )
+        catchup_steps = cfg.get("conditioning_catchup_steps", 0)
 
+        if self.ensemble_mode and catchup_steps > 0:
+            conditioning_params = []
+            backbone_params = []
+
+            for name, param in self.model.named_parameters():
+                if _is_conditioning_parameter(name):
+                    conditioning_params.append(param)
+                else:
+                    backbone_params.append(param)
+
+            optimizer = torch.optim.AdamW(
+                [
+                    {
+                        "params": conditioning_params,
+                        "lr": cfg.optimizer.lr,
+                        "name": "conditioning",
+                    },
+                    {
+                        "params": backbone_params,
+                        "lr": 0.0,
+                        "name": "backbone",
+                    },
+                ],
+                betas=(cfg.optimizer.beta1, cfg.optimizer.beta2),
+                weight_decay=cfg.optimizer.weight_decay,
+            )
+
+            if self.global_rank == 0:
+                logging.info("=" * 40)
+                logging.info("Conditioning catch-up enabled")
+                logging.info(f"Catch-up steps: {catchup_steps}")
+                logging.info(f"Conditioning params: {sum(p.numel() for p in conditioning_params):,}")
+                logging.info(f"Backbone params: {sum(p.numel() for p in backbone_params):,}")
+                logging.info(f"Conditioning LR: {cfg.optimizer.lr}")
+                logging.info("Backbone LR: 0.0")
+                logging.info("=" * 40)
+
+        else:
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                betas=(cfg.optimizer.beta1, cfg.optimizer.beta2),
+                lr=cfg.optimizer.lr,
+                weight_decay=cfg.optimizer.weight_decay,
+            )
+        
         enabled_schedulers = sum(
             [
                 cfg.scheduler.one_cycle.enabled,
@@ -638,7 +695,21 @@ class LitParadis(L.LightningModule):
                     return 1.0
                 return (total_steps - step) / decay_steps
 
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            if self.ensemble_mode and catchup_steps > 0:
+                def conditioning_lr_lambda(step):
+                    return lr_lambda(step)
+
+                def backbone_lr_lambda(step):
+                    if step < catchup_steps:
+                        return 0.0
+                    return lr_lambda(step)
+
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    optimizer,
+                    lr_lambda=[conditioning_lr_lambda, backbone_lr_lambda],
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
             return {
                 "optimizer": optimizer,

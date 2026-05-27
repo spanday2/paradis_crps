@@ -208,3 +208,38 @@ def load_deterministic_checkpoint_into_ensemble(
         logging.info(f"Truly skipped deterministic keys: {len(truly_skipped)}")
         logging.info(f"Skipped key summary: {dict(suffix_counter)}")
         logging.info("=" * 40)
+
+
+def maybe_update_backbone_lr_after_catchup(litmodel) -> None:
+    """Restore backbone LR after the conditioning catch-up phase.
+
+    During the catch-up phase, backbone parameters stay in the optimizer,
+    but their LR is zero. This avoids DDP unused-parameter issues.
+    """
+
+    catchup_steps = litmodel.cfg.training.get("conditioning_catchup_steps", 0)
+
+    if not litmodel.ensemble_mode or catchup_steps <= 0:
+        return
+
+    if not hasattr(litmodel, "_backbone_lr_restored"):
+        litmodel._backbone_lr_restored = False
+
+    if litmodel.global_step >= catchup_steps and not litmodel._backbone_lr_restored:
+        opt = litmodel.optimizers()
+
+        for group in opt.param_groups:
+            if group.get("name") == "backbone":
+                group["lr"] = litmodel.cfg.training.optimizer.lr
+
+        litmodel._backbone_lr_restored = True
+
+        if litmodel.global_rank == 0:
+            logging.info("=" * 40)
+            logging.info(
+                f"Conditioning catch-up finished at global_step={litmodel.global_step}"
+            )
+            logging.info(
+                f"Backbone LR restored to {litmodel.cfg.training.optimizer.lr}"
+            )
+            logging.info("=" * 40)

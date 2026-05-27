@@ -80,10 +80,16 @@ def main(cfg: DictConfig):
         # we don't want to pass it to trainer.fit(..., ckpt_path=...), because Lightning
         # will try to restore it as a full ensemble checkpoint and fail.
         fit_ckpt_path = None
-
+        
+    elif cfg.init.restart:
+        # True resume from a full Lightning ensemble checkpoint
+        # This restores model + optimizer + scheduler + global_step
+        fit_ckpt_path = cfg.init.checkpoint_path
+        
     else:
-        # Normal restart from an ensemble Lightning checkpoint
-        fit_ckpt_path = cfg.init.checkpoint_path if cfg.init.restart else None
+        # Fresh stage initialized from ensemble weights inside LitParadis.__init__.
+        # This does NOT restore optimizer/scheduler/global_step.
+        fit_ckpt_path = None
 
     trainer.fit(
         litmodel,

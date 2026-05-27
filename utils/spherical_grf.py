@@ -164,4 +164,5 @@ if __name__ == "__main__":
     ax3.set_title("South Pole View")
 
     plt.tight_layout()
+    plt.savefig("spherical_grf_dashboard.png", dpi=300, bbox_inches="tight")
     plt.show()

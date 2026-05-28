@@ -18,6 +18,7 @@ from utils.loss import ParadisLoss
 from utils.normalization import denormalize_humidity, denormalize_precipitation
 from utils.crps_loss import (
     TwoMemberAlmostFairCRPS,
+    TwoMemberSpectralAlmostFairCRPS,
     two_member_afcrps_training_step,
     two_member_afcrps_validation_step,
 )
@@ -159,11 +160,27 @@ class LitParadis(L.LightningModule):
         if self.ensemble_mode:
             alpha = cfg.training.get("crps_alpha", 0.95)
             pairwise_coeff = cfg.training.get("crps_pairwise_coeff", None)
-
+            
             self.crps_loss = TwoMemberAlmostFairCRPS(
-                alpha=alpha,
-                pairwise_coeff=pairwise_coeff,
+            alpha=alpha,
+            pairwise_coeff=pairwise_coeff,
             )
+
+            spectral_cfg = cfg.training.get("spectral_crps", {})
+            spectral_weight = spectral_cfg.get("weight", 0.0)
+
+            self.spectral_crps_weight = float(spectral_weight)
+
+            if self.spectral_crps_weight > 0.0:
+                self.spectral_crps_loss = TwoMemberSpectralAlmostFairCRPS(
+                    nlat=self.nlat,
+                    nlon=self.nlon,
+                    alpha=alpha,
+                    pairwise_coeff=pairwise_coeff,
+                    grid=spectral_cfg.get("grid", "equiangular"),
+                )
+            else:
+                self.spectral_crps_loss = None
 
             # Keep ParadisLoss for validation/report RMSE.
             self.loss_fn = ParadisLoss(
@@ -436,51 +453,35 @@ class LitParadis(L.LightningModule):
         # Ensemble mode: memory-efficient two-member afCRPS.
         # Heavy CRPS logic is implemented in utils/crps_loss.py.
         # -------------------------------------------------------------- #
-        batch_loss, batch_fit, batch_spread = two_member_afcrps_training_step(
+        (
+            batch_loss,
+            batch_fit,
+            batch_spread,
+            batch_spectral_loss,
+            batch_total_loss,
+        ) = two_member_afcrps_training_step(
             self,
             input_data,
             true_data,
         )
 
-        self._last_train_loss_value = float(batch_loss.detach().item())
+        self._last_train_loss_value = float(batch_total_loss.detach().item())
 
         opt = self.optimizers()
+        
+        self.log("train_spatial_afcrps_loss", batch_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_spatial_afcrps_fit", batch_fit, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_spatial_afcrps_spread", batch_spread, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
 
-        self.log(
-            "train_loss",
-            batch_loss,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train_crps_fit",
-            batch_fit,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train_crps_spread",
-            batch_spread,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
+        self.log("train_spectral_afcrps_loss", batch_spectral_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+
+        self.log("train_total_afcrps_loss", batch_total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+
         self.log("lr", opt.param_groups[0]["lr"], prog_bar=True)
-        self.log(
-            "forecast_steps",
-            num_steps,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
+        self.log("forecast_steps", num_steps, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
 
-        return batch_loss.detach()
+        return batch_total_loss.detach()
+    
 
     def validation_step(self, batch, batch_idx):
         input_data, true_data = batch
@@ -490,13 +491,20 @@ class LitParadis(L.LightningModule):
         # Ensemble mode
         # -------------------------------------------------------------- #
         if self.ensemble_mode:
-            val_loss, val_fit, val_spread, report_loss = (
-                two_member_afcrps_validation_step(
-                    self,
-                    input_data,
-                    true_data,
-                )
+            (
+                val_loss,
+                val_fit,
+                val_spread,
+                val_spectral_loss,
+                val_total_loss,
+                report_loss,
+            ) = two_member_afcrps_validation_step(
+                self,
+                input_data,
+                true_data,
             )
+
+            logged_val_loss = val_total_loss
 
         # -------------------------------------------------------------- #
         # Deterministic mode
@@ -523,9 +531,11 @@ class LitParadis(L.LightningModule):
                     num_steps,
                 )
 
+            logged_val_loss = val_loss / num_steps
+
         self.log(
             "val_loss",
-            val_loss / num_steps,
+            logged_val_loss,
             on_step=False,
             on_epoch=True,
             prog_bar=True,
@@ -534,19 +544,47 @@ class LitParadis(L.LightningModule):
 
         if self.ensemble_mode:
             self.log(
-                "val_crps_fit",
-                val_fit / num_steps,
+                "val_spatial_afcrps_loss",
+                val_loss,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+            self.log(
+                "val_spatial_afcrps_fit",
+                val_fit,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
                 sync_dist=True,
             )
+
             self.log(
-                "val_crps_spread",
-                val_spread / num_steps,
+                "val_spatial_afcrps_spread",
+                val_spread,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
+                sync_dist=True,
+            )
+
+            self.log(
+                "val_spectral_afcrps_loss",
+                val_spectral_loss,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+            self.log(
+                "val_total_afcrps_loss",
+                val_total_loss,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
                 sync_dist=True,
             )
 
@@ -560,7 +598,7 @@ class LitParadis(L.LightningModule):
                 sync_dist=True,
             )
 
-        return val_loss / num_steps
+        return logged_val_loss
 
     # ---------------------------------------------------------------------- #
     # Optimiser / scheduler
@@ -744,7 +782,10 @@ class LitParadis(L.LightningModule):
         if self.print_losses and self.epoch_start_time is not None:
             elapsed_time = time.time() - self.epoch_start_time
             current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-            train_loss = self.trainer.callback_metrics.get("train_loss")
+            if self.ensemble_mode:
+                train_loss = self.trainer.callback_metrics.get("train_total_afcrps_loss")
+            else:
+                train_loss = self.trainer.callback_metrics.get("train_loss")
             val_loss = self.trainer.callback_metrics.get("val_loss")
 
             if (

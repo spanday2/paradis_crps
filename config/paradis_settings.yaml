@@ -15,7 +15,7 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/saz001/ss8/paradis/released_versions/1_deg/v1.01/01/phase_1/logs/r4/checkpoints/last.ckpt
+  checkpoint_path: null #/home/saz001/ss8/paradis/released_versions/1_deg/v1.01/01/phase_1/logs/r4/checkpoints/last.ckpt
   restart: false
   checkpoint_type: deterministic   # deterministic or ensemble
 dataset:
@@ -31,7 +31,7 @@ compute:
   num_devices: 1
   accelerator: gpu
   use_amp: true
-  batch_size: 2
+  batch_size: 1
   num_workers: 1
   compile: true
 forecast:
@@ -42,7 +42,7 @@ forecast:
   output_file: ./results/FT_LT72h_with_24hrWeights_2022.zarr/
 training:
   max_epochs: -1
-  max_steps: 500
+  max_steps: 200000
   progress_bar: true
   gradient_clip_val: null
   print_losses: false
@@ -51,7 +51,10 @@ training:
   experiment_name: null
   num_ensemble_members: 2
   crps_alpha: 0.95
-  conditioning_catchup_steps: 100
+  conditioning_catchup_steps: 0
+  spectral_crps:
+    weight: 0.1 #put zero to turn off spectral afCRPS
+    grid: equiangular
   dataset:
     start_date: '1990-01-01'
     end_date: '2019-12-31'
@@ -63,7 +66,7 @@ training:
     validation_every_n_steps: null
     validation_batches: null
   optimizer:
-    lr: 0.00002
+    lr: 0.0001
     weight_decay: 0.01
     beta1: 0.9
     beta2: 0.95
@@ -92,8 +95,8 @@ training:
       min_lr: 1.0e-07
     wsd:
       enabled: true
-      warmup: 50
-      decay: 0
+      warmup: 1000
+      decay: 0.2
   variable_loss_weights:
     atmospheric:
       wind_x: 1.0

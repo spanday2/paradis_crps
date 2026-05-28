@@ -50,6 +50,9 @@ training:
   experiment_name: null
   num_ensemble_members: 10
   crps_alpha: 0.95
+  spectral_crps:
+    weight: 0.1 #put zero to turn off spectral afCRPS
+    grid: equiangular
   dataset:
     start_date: '2000-01-01'
     end_date: '2017-12-31'

@@ -6,6 +6,7 @@ memory-efficient streaming training/validation routines used by LitParadis.
 
 import torch
 import torch.nn as nn
+import torch_harmonics as th
 
 
 class TwoMemberAlmostFairCRPS(nn.Module):
@@ -59,6 +60,99 @@ class TwoMemberAlmostFairCRPS(nn.Module):
         spread = self.spread_term(x1, x2)
         loss = fit - spread
         return loss, fit, spread
+    
+class TwoMemberSpectralAlmostFairCRPS(nn.Module):
+    """Two-member almost-fair afCRPS in spectral space.
+
+    This computes afCRPS after applying spherical harmonic transform
+    channel-by-channel.
+
+    It computes afCRPS per channel and spectral mode, then averages.
+
+    For two members:
+
+        0.5 * |x1_hat - y_hat|
+      + 0.5 * |x2_hat - y_hat|
+      - 0.5 * C * |x1_hat - x2_hat|
+
+    where _hat indicates complex SHT coefficients.
+    """
+
+    def __init__(
+        self,
+        nlat: int,
+        nlon: int,
+        alpha: float = 0.95,
+        pairwise_coeff: float | None = None,
+        grid: str = "equiangular",
+    ):
+        super().__init__()
+
+        self.nlat = nlat
+        self.nlon = nlon
+        self.alpha = alpha
+        self.pairwise_coeff = pairwise_coeff
+
+        self.sht = th.RealSHT(nlat, nlon, grid=grid)
+
+    @property
+    def c(self) -> float:
+        if self.pairwise_coeff is not None:
+            return float(self.pairwise_coeff)
+
+        eps = (1.0 - float(self.alpha)) / 2.0
+        return 1.0 - eps
+
+    def _sht_coeffs(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RealSHT to each channel independently.
+
+        Input:
+            x: B, C, lat, lon
+
+        Output:
+            coeffs: B, C, L, M
+        """
+        B, C, lat, lon = x.shape
+
+        if lat != self.nlat or lon != self.nlon:
+            raise ValueError(
+                f"Expected spatial shape ({self.nlat}, {self.nlon}), "
+                f"got ({lat}, {lon})."
+            )
+
+        # RealSHT is safer in float32 under AMP/bfloat16.
+        x_2d = x.float().reshape(B * C, lat, lon)
+
+        coeffs = self.sht(x_2d)
+
+        coeffs = coeffs.reshape(B, C, coeffs.shape[-2], coeffs.shape[-1])
+
+        return coeffs
+
+    def _mean_abs_coeff(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Mean absolute difference of complex spectral coefficients."""
+        a_hat = self._sht_coeffs(a)
+        b_hat = self._sht_coeffs(b)
+
+        return torch.mean(torch.abs(a_hat - b_hat))
+
+    def fit_term(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return 0.5 * self._mean_abs_coeff(x, y)
+
+    def spread_term(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        return 0.5 * self.c * self._mean_abs_coeff(x1, x2)
+
+    def full_loss_for_logging(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        y: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fit = self.fit_term(x1, y) + self.fit_term(x2, y)
+        spread = self.spread_term(x1, x2)
+        loss = fit - spread
+
+        return loss, fit, spread
 
 
 def two_member_afcrps_training_step(
@@ -91,6 +185,9 @@ def two_member_afcrps_training_step(
     log_loss = input_data.new_zeros(())
     log_fit = input_data.new_zeros(())
     log_spread = input_data.new_zeros(())
+    
+    log_spectral_loss = input_data.new_zeros(())
+    log_total_loss = input_data.new_zeros(())
 
     for step in range(num_steps):
         y = true_data[:, step]
@@ -114,7 +211,13 @@ def two_member_afcrps_training_step(
         noise1 = litmodel._embed_raw_noise(raw_noise1)
         x1 = litmodel.forward(member1_inputs[:, step], noise_emb=noise1)
 
-        loss_x1_fit = litmodel.crps_loss.fit_term(x1, y) / num_steps
+        loss_x1_fit = litmodel.crps_loss.fit_term(x1, y)
+        if litmodel.spectral_crps_loss is not None:
+            loss_x1_fit = loss_x1_fit + litmodel.spectral_crps_weight * (
+                litmodel.spectral_crps_loss.fit_term(x1, y)
+            )
+
+        loss_x1_fit = loss_x1_fit / num_steps
         litmodel.manual_backward(loss_x1_fit)
 
         x1_det = x1.detach()
@@ -131,7 +234,18 @@ def two_member_afcrps_training_step(
 
         fit_x2 = litmodel.crps_loss.fit_term(x2, y)
         spread_x2 = litmodel.crps_loss.spread_term(x1_det, x2)
-        loss_x2 = (fit_x2 - spread_x2) / num_steps
+
+        loss_x2 = fit_x2 - spread_x2
+
+        if litmodel.spectral_crps_loss is not None:
+            spec_fit_x2 = litmodel.spectral_crps_loss.fit_term(x2, y)
+            spec_spread_x2 = litmodel.spectral_crps_loss.spread_term(x1_det, x2)
+
+            loss_x2 = loss_x2 + litmodel.spectral_crps_weight * (
+                spec_fit_x2 - spec_spread_x2
+            )
+
+        loss_x2 = loss_x2 / num_steps
 
         litmodel.manual_backward(loss_x2)
 
@@ -151,7 +265,13 @@ def two_member_afcrps_training_step(
         x1_re = litmodel.forward(member1_inputs[:, step], noise_emb=noise1_re)
 
         spread_x1 = litmodel.crps_loss.spread_term(x1_re, x2_det)
-        loss_x1_spread = (-spread_x1) / num_steps
+        loss_x1_spread = -spread_x1
+
+        if litmodel.spectral_crps_loss is not None:
+            spec_spread_x1 = litmodel.spectral_crps_loss.spread_term(x1_re, x2_det)
+            loss_x1_spread = loss_x1_spread - litmodel.spectral_crps_weight * spec_spread_x1
+
+        loss_x1_spread = loss_x1_spread / num_steps
 
         litmodel.manual_backward(loss_x1_spread)
 
@@ -169,9 +289,29 @@ def two_member_afcrps_training_step(
                 x2_det,
                 y,
             )
+
             log_loss += step_loss
             log_fit += step_fit
             log_spread += step_spread
+
+            step_total_loss = step_loss
+
+            if litmodel.spectral_crps_loss is not None:
+                spec_loss, spec_fit, spec_spread = (
+                    litmodel.spectral_crps_loss.full_loss_for_logging(
+                        x1_re_det,
+                        x2_det,
+                        y,
+                    )
+                )
+
+                weighted_spec_loss = litmodel.spectral_crps_weight * spec_loss
+
+                log_spectral_loss += weighted_spec_loss
+
+                step_total_loss = step_total_loss + weighted_spec_loss
+
+            log_total_loss += step_total_loss
 
         # Autoregressive propagation uses detached states.
         member1_inputs = litmodel._autoregression_input_from_output(
@@ -199,7 +339,17 @@ def two_member_afcrps_training_step(
     batch_fit = log_fit / num_steps
     batch_spread = log_spread / num_steps
 
-    return batch_loss, batch_fit, batch_spread
+    batch_spectral_loss = log_spectral_loss / num_steps
+
+    batch_total_loss = log_total_loss / num_steps
+
+    return (
+        batch_loss,
+        batch_fit,
+        batch_spread,
+        batch_spectral_loss,
+        batch_total_loss,
+    )
 
 
 @torch.no_grad()
@@ -207,11 +357,20 @@ def two_member_afcrps_validation_step(
     litmodel,
     input_data: torch.Tensor,
     true_data: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Two-member afCRPS validation step.
 
     Returns:
-        val_loss, val_fit, val_spread, report_loss
+        val_loss, val_fit, val_spread,
+        val_spectral_loss, val_total_loss,
+        report_loss
     """
 
     batch_size = input_data.size(0)
@@ -220,6 +379,9 @@ def two_member_afcrps_validation_step(
     val_loss = input_data.new_zeros(())
     val_fit = input_data.new_zeros(())
     val_spread = input_data.new_zeros(())
+
+    val_spectral_loss = input_data.new_zeros(())
+    val_total_loss = input_data.new_zeros(())
 
     report_loss = torch.zeros(
         len(litmodel.report_ind),
@@ -256,9 +418,26 @@ def two_member_afcrps_validation_step(
             y,
         )
 
+        total_loss_step = loss_step
+
+        if litmodel.spectral_crps_loss is not None:
+            spec_loss_step, _, _ = litmodel.spectral_crps_loss.full_loss_for_logging(
+                x1,
+                x2,
+                y,
+            )
+
+            weighted_spec_loss_step = (
+                litmodel.spectral_crps_weight * spec_loss_step
+            )
+
+            val_spectral_loss += weighted_spec_loss_step
+            total_loss_step = total_loss_step + weighted_spec_loss_step
+
         val_loss += loss_step
         val_fit += fit_step
         val_spread += spread_step
+        val_total_loss += total_loss_step
 
         mean_out = 0.5 * (x1 + x2)
         report_loss += litmodel._get_report_rmse(mean_out, y)
@@ -284,4 +463,17 @@ def two_member_afcrps_validation_step(
         del x2
         del mean_out
 
-    return val_loss, val_fit, val_spread, report_loss
+    val_loss = val_loss / num_steps
+    val_fit = val_fit / num_steps
+    val_spread = val_spread / num_steps
+    val_spectral_loss = val_spectral_loss / num_steps
+    val_total_loss = val_total_loss / num_steps
+
+    return (
+        val_loss,
+        val_fit,
+        val_spread,
+        val_spectral_loss,
+        val_total_loss,
+        report_loss,
+    )

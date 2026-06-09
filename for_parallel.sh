@@ -2,8 +2,8 @@
 #PBS -N ens-inference
 #PBS -l select=1:ncpus=48:mpiprocs=4:ngpus=4:mem=437G:vntype=gpu
 #PBS -l walltime=12:00:00
-#PBS -o forecast.log
-#PBS -e forecast_error.log
+#PBS -o forecastStage2.log
+#PBS -e forecastStage2_error.log
 
 set -euo pipefail
 
@@ -54,7 +54,7 @@ for NODE in $NODES; do
 
         /home/shp000/site8/conda/miniforge3/envs/paradis/bin/python forecast_parallel.py \
             config/paradis_forecast.yaml \
-            > forecast_output_node${NODE_RANK}.log 2>&1
+            > forecast_stage2_node${NODE_RANK}.log 2>&1
     " &
 
     NODE_RANK=$((NODE_RANK + 1))

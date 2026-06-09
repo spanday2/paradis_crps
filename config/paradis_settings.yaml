@@ -15,9 +15,9 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: null #/home/saz001/ss8/paradis/released_versions/1_deg/v1.01/01/phase_1/logs/r4/checkpoints/last.ckpt
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_27/checkpoints/last.ckpt
   restart: false
-  checkpoint_type: deterministic   # deterministic or ensemble
+  checkpoint_type: ensemble   # deterministic or ensemble
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
   time_resolution: 6h
@@ -42,7 +42,7 @@ forecast:
   output_file: ./results/FT_LT72h_with_24hrWeights_2022.zarr/
 training:
   max_epochs: -1
-  max_steps: 200000
+  max_steps: 300000
   progress_bar: true
   gradient_clip_val: null
   print_losses: false

@@ -402,6 +402,7 @@ class LitParadis(L.LightningModule):
     def training_step(self, batch, batch_idx):
         input_data, true_data = batch
         num_steps = input_data.size(1)
+
         
         maybe_update_backbone_lr_after_catchup(self)
 

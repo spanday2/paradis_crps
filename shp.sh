@@ -1,9 +1,9 @@
 #PBS -S /bin/bash
-#PBS -N ens_spectral_CRPS_lr2e-5
+#PBS -N ens_spectral_CRPS_lr1e-4
 #PBS -l select=4:ncpus=48:mpiprocs=4:ngpus=4:mem=437G:vntype=gpu
 #PBS -l walltime=12:00:00
-#PBS -o ens_spectral_CRPS_lr2e-5.log
-#PBS -e ens_spectral_CRPS_lr2e-5_error.log
+#PBS -o ens_spectral_CRPS_lr1e-4.log
+#PBS -e ens_spectral_CRPS_lr1e-4_error.log
 
 export MASTER_PORT=8148
 NODES=$(cat $PBS_NODEFILE | sort | uniq)
@@ -32,7 +32,7 @@ for NODE in $NODES; do
         cd /home/shp000/site7/ensemble/paradis_crps/
 
         echo \"   On \$HOSTNAME with NODE_RANK \$NODE_RANK, MASTER_ADDR \$MASTER_ADDR, MASTER_PORT \$MASTER_PORT, WORLD_SIZE \$WORLD_SIZE, OMP_NUM_THREADS \$OMP_NUM_THREADS\";
-        /home/shp000/site8/conda/miniforge3/envs/paradis/bin/python train.py > output_spectral_CRPS_lr2e-5.log \
+        /home/shp000/site8/conda/miniforge3/envs/paradis/bin/python train.py > output_spectral_CRPS_lr1e-4.log \
             compute.num_nodes=4 \
             compute.num_devices=4 \
     " &

@@ -150,6 +150,7 @@ def setup_worker_distributed(
 
 
 def cleanup_distributed(distributed: bool) -> None:
+    """Synchronize once at the end and destroy the process group."""
     if distributed:
         dist.barrier()
         dist.destroy_process_group()
@@ -169,6 +170,7 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format=f"[rank {rank}] %(asctime)s %(levelname)s - %(message)s",
+        force=True,
     )
 
     # ------------------------------------------------------------
@@ -300,206 +302,282 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
     # ------------------------------------------------------------
     logging.info("Generating forecast...")
 
-    with torch.inference_mode(), torch.no_grad():
-        time_start_ind = 0
-        ind = 0
+    try:
+        with torch.inference_mode(), torch.no_grad():
+            time_start_ind = 0
+            ind = 0
 
-        dataloader = datamodule.predict_dataloader()
-        dataloader = tqdm(
-            dataloader,
-            desc=f"rank {rank}",
-            position=rank,
-            disable=False,
-        )
+            dataloader = datamodule.predict_dataloader()
+            dataloader = tqdm(
+                dataloader,
+                desc=f"rank {rank}",
+                position=rank,
+                disable=False,
+            )
 
-        for input_data, ground_truth in dataloader:
-            batch_size = input_data.shape[0]
+            for input_data, ground_truth in dataloader:
+                batch_size = input_data.shape[0]
 
-            # ====================================================
-            # Ensemble forecast
-            # ====================================================
-            if ensemble_mode:
-                if len(local_members) > 0:
-                    output_forecast = torch.empty(
-                        (
-                            batch_size,
-                            len(local_members),
-                            output_num_forecast_steps,
-                            num_features,
-                            dataset.lat_size,
-                            dataset.lon_size,
-                        ),
-                        device=device,
+                # ====================================================
+                # Ensemble forecast
+                # ====================================================
+                if ensemble_mode:
+                    logging.info(
+                        f"Rank {rank}: starting forecast index {ind}, "
+                        f"batch_size={batch_size}, "
+                        f"local_members={local_members}"
                     )
 
-                    # Each local member keeps its own autoregressive state.
-                    member_inputs = [input_data.clone() for _ in local_members]
+                    if len(local_members) > 0:
+                        # Move input to this rank's GPU once.
+                        # This avoids CPU/GPU mixing during autoregression.
+                        input_data = input_data.to(device, non_blocking=True)
 
-                    for local_m, global_m in enumerate(local_members):
-                        # Stable member-specific seed.
-                        # Member identity remains stable independent of world_size.
-                        member_seed = base_seed + 1000003 * global_m + ind
-                        torch.manual_seed(member_seed)
-
-                        if torch.cuda.is_available():
-                            torch.cuda.manual_seed_all(member_seed)
-
-                        frequency_counter = 0
-
-                        for step in range(num_forecast_steps):
-                            output_data = litmodel(
-                                member_inputs[local_m][:, step].to(device)
-                            )
-
-                            member_inputs[local_m] = (
-                                litmodel._autoregression_input_from_output(
-                                    member_inputs[local_m],
-                                    output_data,
-                                    step,
-                                    num_forecast_steps,
-                                )
-                            )
-
-                            if step % output_frequency == 0:
-                                output_forecast[
-                                    :, local_m, frequency_counter
-                                ] = output_data
-                                frequency_counter += 1
-
-                    output_forecast = output_forecast.cpu()
-
-                    # Denormalize each local member independently.
-                    for local_m in range(len(local_members)):
-                        denormalize_datasets(
-                            ground_truth,
-                            output_forecast[:, local_m],
-                            dataset,
+                        output_forecast = torch.empty(
+                            (
+                                batch_size,
+                                len(local_members),
+                                output_num_forecast_steps,
+                                num_features,
+                                dataset.lat_size,
+                                dataset.lon_size,
+                            ),
+                            device=device,
                         )
 
-                    output_forecast = output_forecast.numpy().astype(np.float64)
-                    ground_truth_np = ground_truth.numpy().astype(np.float64)
+                        # Each local member keeps its own autoregressive state on GPU.
+                        member_inputs = [
+                            input_data.clone()
+                            for _ in local_members
+                        ]
 
-                    # Convert truth once for this rank.
-                    convert_cartesian_to_spherical_winds(
-                        dataset.lat,
-                        dataset.lon,
-                        cfg,
-                        ground_truth_np,
-                        output_features,
-                    )
+                        for local_m, global_m in enumerate(local_members):
+                            # Stable member-specific seed.
+                            # Member identity remains stable independent of world_size.
+                            member_seed = base_seed + 1000003 * global_m + ind
+                            torch.manual_seed(member_seed)
 
-                    # Convert each local ensemble member.
-                    for local_m in range(len(local_members)):
+                            if torch.cuda.is_available():
+                                torch.cuda.manual_seed_all(member_seed)
+
+                            frequency_counter = 0
+
+                            for step in range(num_forecast_steps):
+                                # member_inputs is already on GPU.
+                                output_data = litmodel(
+                                    member_inputs[local_m][:, step]
+                                )
+
+                                member_inputs[local_m] = (
+                                    litmodel._autoregression_input_from_output(
+                                        member_inputs[local_m],
+                                        output_data,
+                                        step,
+                                        num_forecast_steps,
+                                    )
+                                )
+
+                                if step % output_frequency == 0:
+                                    output_forecast[
+                                        :, local_m, frequency_counter
+                                    ] = output_data
+                                    frequency_counter += 1
+
+                        logging.info(
+                            f"Rank {rank}: finished model forecast for index {ind}"
+                        )
+
+                        output_forecast = output_forecast.cpu()
+                        logging.info(
+                            f"Rank {rank}: moved forecast to CPU for index {ind}"
+                        )
+
+                        # Denormalize each local member independently.
+                        for local_m in range(len(local_members)):
+                            denormalize_datasets(
+                                ground_truth,
+                                output_forecast[:, local_m],
+                                dataset,
+                            )
+
+                        logging.info(
+                            f"Rank {rank}: finished denormalization for index {ind}"
+                        )
+
+                        output_forecast = output_forecast.numpy().astype(np.float64)
+                        ground_truth_np = ground_truth.numpy().astype(np.float64)
+
+                        # Convert truth once for this rank.
                         convert_cartesian_to_spherical_winds(
                             dataset.lat,
                             dataset.lon,
                             cfg,
-                            np.ascontiguousarray(output_forecast[:, local_m]),
+                            ground_truth_np,
                             output_features,
                         )
 
-                    if rank_output_file is not None:
-                        save_results_to_zarr(
+                        # Convert each local ensemble member.
+                        for local_m in range(len(local_members)):
+                            convert_cartesian_to_spherical_winds(
+                                dataset.lat,
+                                dataset.lon,
+                                cfg,
+                                np.ascontiguousarray(output_forecast[:, local_m]),
+                                output_features,
+                            )
+
+                        logging.info(
+                            f"Rank {rank}: finished wind conversion for index {ind}"
+                        )
+
+                        if rank_output_file is not None:
+                            logging.info(
+                                f"Rank {rank}: writing Zarr for index {ind}"
+                            )
+
+                            save_results_to_zarr(
+                                output_forecast,
+                                dataset.ds_loader,
+                                atmospheric_vars,
+                                surface_vars,
+                                constant_vars,
+                                dataset,
+                                pressure_levels,
+                                rank_output_file,
+                                ind,
+                                init_times[
+                                    time_start_ind : time_start_ind + batch_size
+                                ],
+                                ensemble_mode=True,
+                            )
+
+                            logging.info(
+                                f"Rank {rank}: finished Zarr write for index {ind}"
+                            )
+
+                    else:
+                        # This can happen if world_size > num_ensemble_members.
+                        # The rank still loops through the dataloader and joins
+                        # final cleanup, but it does not compute/write members.
+                        logging.info(
+                            f"Rank {rank}: no local members for index {ind}; skipping compute/write"
+                        )
+
+                # ====================================================
+                # Deterministic forecast
+                # ====================================================
+                else:
+                    if rank == 0:
+                        logging.info(
+                            f"Rank {rank}: starting deterministic forecast index {ind}, "
+                            f"batch_size={batch_size}"
+                        )
+
+                        input_data = input_data.to(device, non_blocking=True)
+
+                        output_forecast = torch.empty(
+                            (
+                                batch_size,
+                                output_num_forecast_steps,
+                                num_features,
+                                dataset.lat_size,
+                                dataset.lon_size,
+                            ),
+                            device=device,
+                        )
+
+                        frequency_counter = 0
+
+                        for step in range(num_forecast_steps):
+                            output_data = litmodel(input_data[:, step])
+
+                            input_data = litmodel._autoregression_input_from_output(
+                                input_data,
+                                output_data,
+                                step,
+                                num_forecast_steps,
+                            )
+
+                            if step % output_frequency == 0:
+                                output_forecast[:, frequency_counter] = output_data
+                                frequency_counter += 1
+
+                        logging.info(
+                            f"Rank {rank}: finished deterministic model forecast for index {ind}"
+                        )
+
+                        output_forecast = output_forecast.cpu()
+                        logging.info(
+                            f"Rank {rank}: moved deterministic forecast to CPU for index {ind}"
+                        )
+
+                        denormalize_datasets(
+                            ground_truth,
                             output_forecast,
-                            dataset.ds_loader,
-                            atmospheric_vars,
-                            surface_vars,
-                            constant_vars,
                             dataset,
-                            pressure_levels,
-                            rank_output_file,
-                            ind,
-                            init_times[
-                                time_start_ind : time_start_ind + batch_size
-                            ],
-                            ensemble_mode=True,
                         )
 
-            # ====================================================
-            # Deterministic forecast
-            # ====================================================
-            else:
-                if rank == 0:
-                    input_data = input_data.to(device)
+                        output_forecast = output_forecast.numpy().astype(np.float64)
+                        ground_truth_np = ground_truth.numpy().astype(np.float64)
 
-                    output_forecast = torch.empty(
-                        (
-                            batch_size,
-                            output_num_forecast_steps,
-                            num_features,
-                            dataset.lat_size,
-                            dataset.lon_size,
-                        ),
-                        device=device,
-                    )
-
-                    frequency_counter = 0
-
-                    for step in range(num_forecast_steps):
-                        output_data = litmodel(input_data[:, step])
-
-                        input_data = litmodel._autoregression_input_from_output(
-                            input_data,
-                            output_data,
-                            step,
-                            num_forecast_steps,
+                        convert_cartesian_to_spherical_winds(
+                            dataset.lat,
+                            dataset.lon,
+                            cfg,
+                            ground_truth_np,
+                            output_features,
                         )
 
-                        if step % output_frequency == 0:
-                            output_forecast[:, frequency_counter] = output_data
-                            frequency_counter += 1
-
-                    output_forecast = output_forecast.cpu()
-
-                    denormalize_datasets(
-                        ground_truth,
-                        output_forecast,
-                        dataset,
-                    )
-
-                    output_forecast = output_forecast.numpy().astype(np.float64)
-                    ground_truth_np = ground_truth.numpy().astype(np.float64)
-
-                    convert_cartesian_to_spherical_winds(
-                        dataset.lat,
-                        dataset.lon,
-                        cfg,
-                        ground_truth_np,
-                        output_features,
-                    )
-
-                    convert_cartesian_to_spherical_winds(
-                        dataset.lat,
-                        dataset.lon,
-                        cfg,
-                        output_forecast,
-                        output_features,
-                    )
-
-                    if rank_output_file is not None:
-                        save_results_to_zarr(
+                        convert_cartesian_to_spherical_winds(
+                            dataset.lat,
+                            dataset.lon,
+                            cfg,
                             output_forecast,
-                            dataset.ds_loader,
-                            atmospheric_vars,
-                            surface_vars,
-                            constant_vars,
-                            dataset,
-                            pressure_levels,
-                            rank_output_file,
-                            ind,
-                            init_times[
-                                time_start_ind : time_start_ind + batch_size
-                            ],
-                            ensemble_mode=False,
+                            output_features,
                         )
 
-            if distributed:
-                dist.barrier()
+                        if rank_output_file is not None:
+                            logging.info(
+                                f"Rank {rank}: writing deterministic Zarr for index {ind}"
+                            )
 
-            ind += 1
-            time_start_ind += batch_size
+                            save_results_to_zarr(
+                                output_forecast,
+                                dataset.ds_loader,
+                                atmospheric_vars,
+                                surface_vars,
+                                constant_vars,
+                                dataset,
+                                pressure_levels,
+                                rank_output_file,
+                                ind,
+                                init_times[
+                                    time_start_ind : time_start_ind + batch_size
+                                ],
+                                ensemble_mode=False,
+                            )
 
-    cleanup_distributed(distributed)
+                            logging.info(
+                                f"Rank {rank}: finished deterministic Zarr write for index {ind}"
+                            )
+
+                # ----------------------------------------------------
+                # IMPORTANT:
+                # Do not synchronize after every forecast initialization.
+                # Each rank writes its own Zarr file, so a per-batch barrier
+                # can make fast ranks wait forever if another rank is slow
+                # or stuck in I/O.
+                #
+                # The final synchronization happens in cleanup_distributed().
+                # ----------------------------------------------------
+                # if distributed:
+                #     dist.barrier()
+
+                ind += 1
+                time_start_ind += batch_size
+
+    finally:
+        cleanup_distributed(distributed)
 
     logging.info("Forecast finished successfully.")
 

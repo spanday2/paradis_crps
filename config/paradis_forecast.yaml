@@ -11,6 +11,9 @@ model:
   adv_interpolation: bicubic
   projected_advection: true
   num_encoder_layers: 1
+  noise_type: raw_noise  # raw_noise or grf_noise
+  grf_effective_resolution: 5
+  grf_n_waves: null
   noise_channels: 4
   noise_mlp_hidden_dim: 32
 init:
@@ -48,7 +51,7 @@ training:
   log_every_n_steps: 100
   log_dir: logs
   experiment_name: null
-  num_ensemble_members: 10
+  num_ensemble_members: 4
   crps_alpha: 0.95
   spectral_crps:
     weight: 0.1 #put zero to turn off spectral afCRPS

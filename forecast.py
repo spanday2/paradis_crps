@@ -42,6 +42,8 @@ def main():
     """
 
     cfg = OmegaConf.load(sys.argv[1])
+    if len(sys.argv) > 2:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_cli(sys.argv[2:]))
 
     # ------------------------------------------------------------
     # Reproducibility
@@ -83,6 +85,7 @@ def main():
 
     # Ensemble configuration — mirrors LitParadis setup
     noise_channels = cfg.model.get("noise_channels", 0)
+    noise_type = cfg.model.get("noise_type", "raw_noise")
     ensemble_mode = noise_channels > 0
     num_members = cfg.training.get("num_ensemble_members", 4) if ensemble_mode else 1
 
@@ -124,11 +127,24 @@ def main():
 
     logging.info(f"Number of forecasts to generate: {len(init_times)}")
     if ensemble_mode:
-        logging.info(f"Ensemble mode: {num_members} members")
         logging.info(
-            "Using one global forecast seed. Members receive different fresh "
-            "noise samples from the same seeded RNG stream."
+            f"Ensemble mode: {num_members} members, noise_type={noise_type}"
         )
+        if noise_type == "raw_noise":
+            logging.info(
+                "Using one global forecast seed. Members receive different fresh "
+                "noise samples from the same seeded RNG stream."
+            )
+        elif noise_type == "grf_noise":
+            logging.info(
+                "Using one global forecast seed. Members receive different fresh "
+                "GRF noise samples from the same seeded RNG stream."
+            )
+        else:
+            raise ValueError(
+                f"Unsupported model.noise_type='{noise_type}'. "
+                "Expected 'raw_noise' or 'grf_noise'."
+            )
 
     # Run forecast
     logging.info("Generating forecast...")
@@ -160,13 +176,20 @@ def main():
                     frequency_counter = 0
 
                     for step in range(num_forecast_steps):
-                        # noise_emb is not provided here.
-                        # Therefore, Paradis.forward() auto-samples fresh
-                        # per-grid-point noise. Since the global RNG seed was
-                        # set at the beginning, the full ensemble is reproducible.
-                        output_data = litmodel(
-                            member_inputs[m][:, step].to(device),
-                        )
+                        member_input = member_inputs[m][:, step].to(device)
+
+                        if noise_type == "grf_noise":
+                            grf_noise = litmodel._sample_raw_noise(
+                                batch_size=batch_size,
+                                device=device,
+                                dtype=member_input.dtype,
+                            )
+                            noise_emb = litmodel._embed_raw_noise(grf_noise)
+                            output_data = litmodel(member_input, noise_emb=noise_emb)
+                        else:
+                            # Preserve the current raw-noise behavior by letting
+                            # the model auto-sample fresh noise internally.
+                            output_data = litmodel(member_input)
 
                         member_inputs[m] = litmodel._autoregression_input_from_output(
                             member_inputs[m],

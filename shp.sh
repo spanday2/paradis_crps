@@ -1,9 +1,9 @@
 #PBS -S /bin/bash
-#PBS -N ens_spectral_CRPS_lr2e-5
-#PBS -l select=4:ncpus=48:mpiprocs=4:ngpus=4:mem=437G:vntype=gpu
+#PBS -N ens_grf_train
+#PBS -l select=1:ncpus=24:mpiprocs=1:ngpus=1:mem=180G:vntype=gpu
 #PBS -l walltime=12:00:00
-#PBS -o ens_spectral_CRPS_lr2e-5.log
-#PBS -e ens_spectral_CRPS_lr2e-5_error.log
+#PBS -o ens_grf_noise_train_1gpu_moira_res_3.log
+#PBS -e ens_grf_noise_train_error_1gpu_moira_res_3.log
 
 export MASTER_PORT=8148
 NODES=$(cat $PBS_NODEFILE | sort | uniq)
@@ -29,12 +29,15 @@ for NODE in $NODES; do
         export NODE_RANK=\"$NODE_RANK\";
         export OMP_NUM_THREADS=\"$OMP_NUM_THREADS\";
 
-        cd /home/shp000/site7/ensemble/paradis_crps/
+        cd /home/siw001/hall7/paradis_crps_isotropic_noise/paradis_crps/
 
         echo \"   On \$HOSTNAME with NODE_RANK \$NODE_RANK, MASTER_ADDR \$MASTER_ADDR, MASTER_PORT \$MASTER_PORT, WORLD_SIZE \$WORLD_SIZE, OMP_NUM_THREADS \$OMP_NUM_THREADS\";
-        /home/shp000/site8/conda/miniforge3/envs/paradis/bin/python train.py > output_spectral_CRPS_lr2e-5.log \
-            compute.num_nodes=4 \
-            compute.num_devices=4 \
+        
+        /home/shp000/site8/conda/miniforge3/envs/paradis/bin/python train.py > output_grf_noise_moira_1gpu_res_3.log \
+            compute.num_nodes=1 \
+            compute.num_devices=1 \
+            model.noise_type=grf_noise \
+            model.grf_effective_resolution=3 \
     " &
     NODE_RANK=$((NODE_RANK + 1))
 done

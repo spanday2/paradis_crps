@@ -16,6 +16,7 @@ from data.datamodule import Era5DataModule
 from model.paradis import Paradis
 from utils.loss import ParadisLoss
 from utils.normalization import denormalize_humidity, denormalize_precipitation
+from utils.spherical_grf import generate_spherical_grf
 from utils.crps_loss import (
     TwoMemberAlmostFairCRPS,
     TwoMemberSpectralAlmostFairCRPS,
@@ -79,6 +80,17 @@ class LitParadis(L.LightningModule):
         lat_grid = datamodule.dataset.lat_rad_grid
         lon_grid = datamodule.dataset.lon_rad_grid
 
+        self.register_buffer(
+            "lat_rad_grid",
+            lat_grid.to(dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lon_rad_grid",
+            lon_grid.to(dtype=torch.float32),
+            persistent=False,
+        )
+
         self.model = Paradis(datamodule, cfg, lat_grid, lon_grid)
         self.cfg = cfg
         self.n_inputs = cfg.dataset.n_time_inputs
@@ -89,9 +101,18 @@ class LitParadis(L.LightningModule):
         self.noise_channels = cfg.model.get("noise_channels", 0)
         self.ensemble_mode = self.noise_channels > 0
         self.num_members = cfg.training.get("num_ensemble_members", 2)
+        self.noise_type = cfg.model.get("noise_type", "raw_noise")
+        self.grf_effective_resolution = cfg.model.get("grf_effective_resolution", 5)
+        self.grf_n_waves = cfg.model.get("grf_n_waves", None)
 
         self.nlat = lat_grid.shape[0]
         self.nlon = lat_grid.shape[1]
+
+        if self.noise_type not in {"raw_noise", "grf_noise"}:
+            raise ValueError(
+                f"Unsupported model.noise_type='{self.noise_type}'. "
+                "Expected 'raw_noise' or 'grf_noise'."
+            )
 
         if self.ensemble_mode and not cfg.forecast.enable:
             if self.num_members != 2:
@@ -338,13 +359,43 @@ class LitParadis(L.LightningModule):
         Shape:
             (B, noise_channels, lat, lon)
         """
-        return torch.randn(
-            batch_size,
-            self.noise_channels,
-            self.nlat,
-            self.nlon,
-            device=device,
-            dtype=dtype,
+        if self.noise_type == "raw_noise":
+            return torch.randn(
+                batch_size,
+                self.noise_channels,
+                self.nlat,
+                self.nlon,
+                device=device,
+                dtype=dtype,
+            )
+        elif self.noise_type == "grf_noise":
+            lat = self.lat_rad_grid.to(device=device, dtype=dtype)
+            lon = self.lon_rad_grid.to(device=device, dtype=dtype)
+
+            batch_fields = []
+
+            for _ in range(batch_size):
+                channel_fields = []
+
+                for _ in range(self.noise_channels):
+                    channel_fields.append(
+                        generate_spherical_grf(
+                            lat,
+                            lon,
+                            effective_resolution=self.grf_effective_resolution,
+                            n_waves=self.grf_n_waves,
+                            device=str(device),
+                            dtype=dtype,
+                        )
+                    )
+
+                batch_fields.append(torch.stack(channel_fields, dim=0))
+
+            return torch.stack(batch_fields, dim=0)
+
+        raise ValueError(
+            f"Unsupported model.noise_type='{self.noise_type}'. "
+            "Expected 'raw_noise' or 'grf_noise'."
         )
 
     def _embed_raw_noise(self, raw_noise: torch.Tensor) -> torch.Tensor:

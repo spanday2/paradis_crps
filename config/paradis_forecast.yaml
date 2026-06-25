@@ -18,7 +18,7 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps_2/logs/lightning_logs/version_22/checkpoints/last.ckpt
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps_2/logs/lightning_logs/cosine/stage2_1e-6/version_22/checkpoints/last.ckpt
   restart: false
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
@@ -38,10 +38,10 @@ compute:
   compile: true
 forecast:
   enable: true
-  start_date: '2022-07-01'
-  end_date: '2022-07-31'
+  start_date: '2022-01-01'
+  end_date: '2022-01-31'
   output_frequency: 1
-  output_file: ./results/stage2_forecast/onedeg_stage2_2022_july.zarr/
+  output_file: ./results/cosine/one_deg_stage2_2022_jan.zarr
 training:
   max_epochs: -1
   max_steps: 300000

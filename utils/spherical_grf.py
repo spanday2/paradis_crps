@@ -79,7 +79,7 @@ def generate_spherical_grf(
 
     if n_waves is None:
         n_waves = min(5000, max(1000, int(10 * sigma**2)))
-        print(f"n_waves set to {n_waves}")
+        # print(f"n_waves set to {n_waves}")
 
     # Sample wave vectors from 3D Gaussian
     K = torch.randn(3, n_waves, device=device, dtype=dtype) * sigma

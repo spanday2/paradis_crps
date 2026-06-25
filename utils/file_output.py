@@ -1,5 +1,6 @@
 import os
 import shutil
+
 import dask
 import numpy
 import xarray
@@ -9,10 +10,8 @@ from utils.mhuaes import mhuaes3
 
 def save_results_to_zarr(
     data,
-    ds_input_data,
     atmospheric_vars,
     surface_vars,
-    constant_vars,
     dataset,
     pressure_levels,
     filename,
@@ -20,25 +19,81 @@ def save_results_to_zarr(
     init_times,
     ensemble_mode: bool = False,
 ):
-    """Save results to a Zarr file.
+    """Save forecast results to a Zarr file.
+
+    Important convention in this version:
+        We do NOT save the initial input/analysis field.
+
+        Therefore:
+            prediction_timedelta index 0 = first model forecast output
+
+        If the model forecast step is 6 hours, then physically:
+            prediction_timedelta = 0h  -> valid at init + 6h
+            prediction_timedelta = 6h  -> valid at init + 12h
+            prediction_timedelta = 12h -> valid at init + 18h
 
     Args:
-        data:          In deterministic mode: (B, output_steps, F, lat, lon)
-                       In ensemble mode:      (B, M, output_steps, F, lat, lon)
-        ensemble_mode: If True, data has an extra member dimension (M) and
-                       a 'member' coordinate is added to the output dataset.
+        data:
+            Deterministic mode:
+                shape = (B, output_steps, F, lat, lon)
+
+            Ensemble mode:
+                shape = (B, M, output_steps, F, lat, lon)
+
+        ds_input_data:
+            Kept in the function signature for compatibility, but no longer
+            used to prepend the initial input field.
+
+        atmospheric_vars:
+            Output atmospheric variable names, for example:
+                geopotential
+                u_component_of_wind
+                v_component_of_wind
+                vertical_velocity
+                specific_humidity
+                temperature
+
+        surface_vars:
+            Output surface variable names, for example:
+                10m_u_component_of_wind
+                10m_v_component_of_wind
+                2m_temperature
+                mean_sea_level_pressure
+
+        constant_vars:
+            Kept for compatibility.
+
+        dataset:
+            Dataset object containing latitude, longitude, constants, etc.
+
+        pressure_levels:
+            List of pressure levels.
+
+        filename:
+            Output Zarr path.
+
+        ind:
+            Forecast batch index. If ind == 0, create a new Zarr.
+            Otherwise append along time.
+
+        init_times:
+            Initialization times for this batch.
+
+        ensemble_mode:
+            If True, data has member dimension.
     """
+
     data_vars = {}
     num_levels = len(pressure_levels)
 
-    input_data = ds_input_data.sel(time=init_times).sortby("time")["data"].values
-
+    # ============================================================
+    # Ensemble forecast output
+    # ============================================================
     if ensemble_mode:
-        # data shape: (B, M, output_steps, F, lat, lon)
+        # data shape:
+        #   (B, M, output_steps, F, lat, lon)
         num_members = data.shape[1]
 
-        # Atmospheric variables — add member dim
-        # final shape per var: (B, M, output_steps+1, levels, lat, lon)
         atm_dims = [
             "time",
             "member",
@@ -52,32 +107,17 @@ def save_results_to_zarr(
             beg_ind = i * num_levels
             end_ind = (i + 1) * num_levels
 
-            # input_data original layout appears to be:
-            # (B, lat, lon, F)
+            # Forecast slice shape:
+            #   (B, M, output_steps, level, lat, lon)
             #
-            # input slice:
-            # input_data[..., beg_ind:end_ind] -> (B, lat, lon, level)
-            # transpose -> (B, level, lat, lon)
-            # add member and prediction_timedelta dims -> (B, 1, 1, level, lat, lon)
-            # repeat over members -> (B, M, 1, level, lat, lon)
-            input_slice = (
-                input_data[..., beg_ind:end_ind]
-                .transpose(0, 3, 1, 2)[:, None, None]
-                .repeat(num_members, axis=1)
-            )
-
-            # forecast slice:
-            # data[:, :, :, beg_ind:end_ind] should be
-            # (B, M, steps, level, lat, lon)
+            # We do NOT concatenate the initial input anymore.
             forecast_slice = data[:, :, :, beg_ind:end_ind]
 
             data_vars[feature] = (
                 atm_dims,
-                numpy.concatenate((input_slice, forecast_slice), axis=2),
+                forecast_slice,
             )
 
-        # Surface variables — add member dim
-        # final shape per var: (B, M, output_steps+1, lat, lon)
         sur_dims = [
             "time",
             "member",
@@ -87,30 +127,33 @@ def save_results_to_zarr(
         ]
 
         for i, feature in enumerate(surface_vars):
+            # Do not save 10m vertical wind if it exists in feature list.
             if feature == "wind_z_10m":
                 continue
 
             feat_idx = len(atmospheric_vars) * num_levels + i
 
-            # input slice: (B, 1, 1, lat, lon), repeated over members
-            input_slice = (
-                input_data[..., feat_idx][:, None, None]
-                .repeat(num_members, axis=1)
-            )
-
-            # forecast slice: (B, M, output_steps, lat, lon)
+            # Forecast slice shape:
+            #   (B, M, output_steps, lat, lon)
+            #
+            # We do NOT concatenate the initial input anymore.
             forecast_slice = data[:, :, :, feat_idx]
 
             data_vars[feature] = (
                 sur_dims,
-                numpy.concatenate((input_slice, forecast_slice), axis=2),
+                forecast_slice,
             )
 
-        coords_extra = {"member": numpy.arange(num_members)}
+        coords_extra = {
+            "member": numpy.arange(num_members),
+        }
 
+    # ============================================================
+    # Deterministic forecast output
+    # ============================================================
     else:
-        # Deterministic — original behaviour unchanged
-        # data shape: (B, output_steps, F, lat, lon)
+        # data shape:
+        #   (B, output_steps, F, lat, lon)
 
         atm_dims = [
             "time",
@@ -124,16 +167,15 @@ def save_results_to_zarr(
             beg_ind = i * num_levels
             end_ind = (i + 1) * num_levels
 
+            # Forecast slice shape:
+            #   (B, output_steps, level, lat, lon)
+            #
+            # We do NOT concatenate the initial input anymore.
+            forecast_slice = data[:, :, beg_ind:end_ind]
+
             data_vars[feature] = (
                 atm_dims,
-                numpy.concatenate(
-                    (
-                        input_data[..., beg_ind:end_ind]
-                        .transpose(0, 3, 1, 2)[:, None],
-                        data[:, :, beg_ind:end_ind],
-                    ),
-                    axis=1,
-                ),
+                forecast_slice,
             )
 
         sur_dims = [
@@ -144,29 +186,32 @@ def save_results_to_zarr(
         ]
 
         for i, feature in enumerate(surface_vars):
+            # Do not save 10m vertical wind if it exists in feature list.
             if feature == "wind_z_10m":
                 continue
 
             feat_idx = len(atmospheric_vars) * num_levels + i
 
+            # Forecast slice shape:
+            #   (B, output_steps, lat, lon)
+            #
+            # We do NOT concatenate the initial input anymore.
+            forecast_slice = data[:, :, feat_idx]
+
             data_vars[feature] = (
                 sur_dims,
-                numpy.concatenate(
-                    (
-                        input_data[..., feat_idx][:, None],
-                        data[:, :, feat_idx],
-                    ),
-                    axis=1,
-                ),
+                forecast_slice,
             )
 
         coords_extra = {}
 
+    # ============================================================
+    # Constant variables
+    # ============================================================
     if ind == 0:
-        # Constant variables — no member dim, same in both modes
         con_dims = ["latitude", "longitude"]
 
-        for i, feature in enumerate(dataset.ds_constants.data_vars):
+        for feature in dataset.ds_constants.data_vars:
             if feature in con_dims:
                 continue
 
@@ -175,35 +220,61 @@ def save_results_to_zarr(
                 dataset.ds_constants[feature].data,
             )
 
-    # Number of output steps depends on mode
-    num_output_steps = data.shape[2] if ensemble_mode else data.shape[1]
+    # ============================================================
+    # Number of forecast output steps
+    # ============================================================
+    if ensemble_mode:
+        num_output_steps = data.shape[2]
+    else:
+        num_output_steps = data.shape[1]
 
-    # Define coordinates
+    # ============================================================
+    # Coordinates
+    #
+    # Important:
+    #   We keep prediction_timedelta starting at 0.
+    #
+    #   prediction_timedelta = 0h means first saved model forecast.
+    #   In your setup, that first model forecast is physically valid +6h.
+    # ============================================================
     coords = {
         "latitude": dataset.lat,
         "longitude": dataset.lon,
         "time": init_times,
         "level": pressure_levels,
         "prediction_timedelta": (
-            numpy.arange(num_output_steps + 1)
+            numpy.arange(num_output_steps)
             * numpy.timedelta64(6 * 3600 * 10**9, "ns")
         ),
         **coords_extra,
     }
 
-    # If this is the first write, remove any existing Zarr store
+    # ============================================================
+    # Remove old output on first write
+    # ============================================================
     if ind == 0 and os.path.exists(filename):
         shutil.rmtree(filename)
 
+    # ============================================================
     # Create dataset
+    # ============================================================
     ds = xarray.Dataset(data_vars=data_vars, coords=coords)
 
-    # Add dewpoint depression to files
-    hu = ds.specific_humidity
-    tt = ds.temperature
-    ps = ds.level * 100
-    ds = ds.assign(dewpoint_depression=mhuaes3(hu, tt, ps))
+    # ============================================================
+    # Add dewpoint depression
+    # ============================================================
+    if "specific_humidity" in ds and "temperature" in ds:
+        hu = ds.specific_humidity
+        tt = ds.temperature
+        ps = ds.level * 100
 
+        ds = ds.assign(
+            dewpoint_depression=mhuaes3(hu, tt, ps)
+        )
+
+    # ============================================================
+    # Chunking
+    # ============================================================
     def get_zarr_chunks(da):
         chunks = []
 
@@ -231,8 +302,10 @@ def save_results_to_zarr(
 
         return tuple(chunks)
 
+    # ============================================================
+    # Write Zarr
+    # ============================================================
     with dask.config.set(scheduler="threads"):
-
         if ind == 0:
             encoding = {
                 "time": {"dtype": "float64"},

@@ -11,15 +11,15 @@ model:
   adv_interpolation: bicubic
   projected_advection: true
   num_encoder_layers: 1
-  noise_type: raw_noise  # raw_noise or grf_noise
-  grf_effective_resolution: 5
+  noise_type: grf_noise  # raw_noise or grf_noise
+  grf_effective_resolution: 3
   grf_n_waves: null
   noise_channels: 4
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_27/checkpoints/last.ckpt
-  restart: false
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_40/checkpoints/last.ckpt
+  restart: true
   checkpoint_type: ensemble   # deterministic or ensemble
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
@@ -56,7 +56,7 @@ training:
   crps_alpha: 0.95
   conditioning_catchup_steps: 0
   spectral_crps:
-    weight: 0.1 #put zero to turn off spectral afCRPS
+    weight: 0 #put zero to turn off spectral afCRPS
     grid: equiangular
   dataset:
     start_date: '1990-01-01'
@@ -69,7 +69,7 @@ training:
     validation_every_n_steps: null
     validation_batches: null
   optimizer:
-    lr: 1e-5
+    lr: 2e-5
     weight_decay: 0.01
     beta1: 0.9
     beta2: 0.95

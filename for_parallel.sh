@@ -1,5 +1,5 @@
 #PBS -S /bin/bash
-#PBS -N ens-inference
+#PBS -N ens-inference_SN
 #PBS -l select=1:ncpus=48:mpiprocs=4:ngpus=4:mem=437G:vntype=gpu
 #PBS -l walltime=12:00:00
 #PBS -o forecastStage2.log

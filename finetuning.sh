@@ -1,5 +1,6 @@
+#!/bin/bash
 #PBS -S /bin/bash
-#PBS -N ens_1deg_finetune
+#PBS -N ens_SphNoi_finetune
 #PBS -l select=4:ncpus=48:mpiprocs=4:ngpus=4:mem=437G:vntype=gpu
 #PBS -l walltime=12:00:00
 #PBS -o ens_1deg_finetune.log
@@ -11,6 +12,7 @@ export MASTER_PORT=8148
 
 NODES=$(sort -u "$PBS_NODEFILE")
 MASTER_ADDR=$(echo "$NODES" | head -n 1)
+export MASTER_ADDR
 export WORLD_SIZE=$(wc -l < "$PBS_NODEFILE")
 export OMP_NUM_THREADS=1
 
@@ -23,11 +25,11 @@ echo "OMP_NUM_THREADS is: $OMP_NUM_THREADS"
 PY=/home/shp000/site8/conda/miniforge3/envs/paradis/bin/python
 CODEDIR=/home/shp000/site7/ensemble/paradis_crps
 
-FIRST_CKPT=/home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_82/checkpoints/0003500.ckpt
+FIRST_CKPT=/home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_33/checkpoints/0003000.ckpt
 
 PREV_CKPT="$FIRST_CKPT"
 
-for FS in 8 9 10 11 12; do
+for FS in 10 12; do
 
     EXP="ens_1deg_stage_${FS}"
 
@@ -62,13 +64,13 @@ for FS in 8 9 10 11 12; do
 
             mkdir -p run_outputs
 
-            echo \"On \$HOSTNAME with NODE_RANK=\$NODE_RANK MASTER_ADDR=\$MASTER_ADDR MASTER_PORT=\$WORLD_SIZE\"
+            echo \"On \$HOSTNAME with NODE_RANK=\$NODE_RANK MASTER_ADDR=\$MASTER_ADDR MASTER_PORT=\$MASTER_PORT WORLD_SIZE=\$WORLD_SIZE\"
 
             $PY train.py \
                 model.forecast_steps=$FS \
                 compute.num_nodes=4 \
                 compute.num_devices=4 \
-                training.max_steps=3500 \
+                training.max_steps=3000 \
                 init.checkpoint_path=\"\\\"$PREV_CKPT\\\"\" \
                 init.restart=false \
                 > run_outputs/output_${EXP}_rank${NODE_RANK}.log 2>&1
@@ -90,19 +92,36 @@ for FS in 8 9 10 11 12; do
 
     echo "Finished forecast_steps=${FS}"
 
+    # ------------------------------------------------------------
+    # Find the new 3000-step checkpoint from this stage.
+    # This explicitly ignores last.ckpt.
+    # ------------------------------------------------------------
+
     NEW_CKPT=$(find "$CODEDIR/logs/lightning_logs" \
         -path "*/checkpoints/*.ckpt" \
         -type f \
         -newermt "@${STAGE_START_TIME}" \
+        ! -name "last.ckpt" \
+        -name "*3000*.ckpt" \
         -printf "%T@ %p\n" | sort -n | tail -1 | cut -d' ' -f2-)
 
     if [ -z "$NEW_CKPT" ]; then
-        echo "ERROR: no new checkpoint was created for forecast_steps=${FS}"
+        echo "ERROR: no new 3000-step checkpoint was created for forecast_steps=${FS}"
         echo "The script will stop here and will NOT continue to the next FS."
         echo "Check:"
         echo "$CODEDIR/run_outputs/output_${EXP}_rank0.log"
+        echo ""
+        echo "New checkpoints created after stage start were:"
+        find "$CODEDIR/logs/lightning_logs" \
+            -path "*/checkpoints/*.ckpt" \
+            -type f \
+            -newermt "@${STAGE_START_TIME}" \
+            -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" | sort || true
         exit 1
     fi
+
+    echo "3000-step checkpoint created by forecast_steps=${FS}:"
+    echo "$NEW_CKPT"
 
     PREV_CKPT="$NEW_CKPT"
 

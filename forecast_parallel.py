@@ -43,13 +43,13 @@ def set_forecast_seed(seed: int) -> None:
 # Distributed helpers
 # ---------------------------------------------------------------------
 def is_distributed_env() -> bool:
-    """Return True if PBS script has set training-style distributed variables."""
+    """Return True if PBS script has set distributed variables."""
     required = ["MASTER_ADDR", "MASTER_PORT", "WORLD_SIZE", "NODE_RANK"]
     return all(k in os.environ for k in required)
 
 
 def make_rank_output_file(output_file: str, rank: int, world_size: int) -> str:
-    """Create one Zarr output path per global rank and ensure directory exists."""
+    """Create one Zarr output path per global rank."""
     path = Path(output_file)
 
     if path.suffix == ".zarr":
@@ -60,7 +60,6 @@ def make_rank_output_file(output_file: str, rank: int, world_size: int) -> str:
         rank_path = Path(f"{output_file}_rank{rank:03d}_of_{world_size:03d}.zarr")
 
     rank_path.parent.mkdir(parents=True, exist_ok=True)
-
     return str(rank_path)
 
 
@@ -103,7 +102,7 @@ def setup_worker_distributed(
     PBS launches one parent forecast.py per node.
     Each parent spawns one local worker per GPU.
 
-    Global rank is computed as:
+    Global rank:
         global_rank = NODE_RANK * compute.num_devices + local_rank
     """
 
@@ -195,7 +194,6 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
 
     atmospheric_vars = cfg.features.output.atmospheric
     surface_vars = cfg.features.output.surface
-    constant_vars = cfg.features.input.constants
     pressure_levels = cfg.features.pressure_levels
 
     num_levels = len(pressure_levels)
@@ -206,7 +204,13 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
     num_forecast_steps = int(cfg.model.forecast_steps)
     output_frequency = int(cfg.forecast.output_frequency)
 
-    # More robust than num_forecast_steps // output_frequency.
+    # Number of saved forecast outputs.
+    # Example:
+    #   num_forecast_steps = 40
+    #   output_frequency = 1
+    #   saves 40 forecast outputs.
+    #
+    # No initial input is included here.
     output_num_forecast_steps = len(
         range(0, num_forecast_steps, output_frequency)
     )
@@ -248,7 +252,7 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
     litmodel.to(device).eval()
 
     # ------------------------------------------------------------
-    # Rename variables for output
+    # Rename variables for output Zarr names
     # ------------------------------------------------------------
     atmospheric_vars = replace_variable_name(
         "wind_x",
@@ -279,6 +283,9 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
 
     init_times = dataset.time
 
+    # ------------------------------------------------------------
+    # Output paths
+    # ------------------------------------------------------------
     if cfg.forecast.output_file is not None:
         rank_output_file = make_rank_output_file(
             cfg.forecast.output_file,
@@ -329,8 +336,6 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                     )
 
                     if len(local_members) > 0:
-                        # Move input to this rank's GPU once.
-                        # This avoids CPU/GPU mixing during autoregression.
                         input_data = input_data.to(device, non_blocking=True)
 
                         output_forecast = torch.empty(
@@ -345,7 +350,7 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                             device=device,
                         )
 
-                        # Each local member keeps its own autoregressive state on GPU.
+                        # Each local member keeps its own autoregressive state.
                         member_inputs = [
                             input_data.clone()
                             for _ in local_members
@@ -353,7 +358,6 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
 
                         for local_m, global_m in enumerate(local_members):
                             # Stable member-specific seed.
-                            # Member identity remains stable independent of world_size.
                             member_seed = base_seed + 1000003 * global_m + ind
                             torch.manual_seed(member_seed)
 
@@ -363,7 +367,6 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                             frequency_counter = 0
 
                             for step in range(num_forecast_steps):
-                                # member_inputs is already on GPU.
                                 output_data = litmodel(
                                     member_inputs[local_m][:, step]
                                 )
@@ -392,7 +395,8 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                             f"Rank {rank}: moved forecast to CPU for index {ind}"
                         )
 
-                        # Denormalize each local member independently.
+                        # Denormalize only forecast outputs.
+                        # No initial input/analysis field is handled here.
                         for local_m in range(len(local_members)):
                             denormalize_datasets(
                                 ground_truth,
@@ -405,26 +409,23 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                         )
 
                         output_forecast = output_forecast.numpy().astype(np.float64)
-                        ground_truth_np = ground_truth.numpy().astype(np.float64)
 
-                        # Convert truth once for this rank.
-                        convert_cartesian_to_spherical_winds(
-                            dataset.lat,
-                            dataset.lon,
-                            cfg,
-                            ground_truth_np,
-                            output_features,
-                        )
-
-                        # Convert each local ensemble member.
+                        # Convert only forecast outputs from Cartesian to spherical winds.
+                        # No initial input/analysis field is converted or saved here.
                         for local_m in range(len(local_members)):
+                            member_forecast = np.ascontiguousarray(
+                                output_forecast[:, local_m]
+                            )
+
                             convert_cartesian_to_spherical_winds(
                                 dataset.lat,
                                 dataset.lon,
                                 cfg,
-                                np.ascontiguousarray(output_forecast[:, local_m]),
+                                member_forecast,
                                 output_features,
                             )
+
+                            output_forecast[:, local_m] = member_forecast
 
                         logging.info(
                             f"Rank {rank}: finished wind conversion for index {ind}"
@@ -437,10 +438,8 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
 
                             save_results_to_zarr(
                                 output_forecast,
-                                dataset.ds_loader,
                                 atmospheric_vars,
                                 surface_vars,
-                                constant_vars,
                                 dataset,
                                 pressure_levels,
                                 rank_output_file,
@@ -456,11 +455,9 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                             )
 
                     else:
-                        # This can happen if world_size > num_ensemble_members.
-                        # The rank still loops through the dataloader and joins
-                        # final cleanup, but it does not compute/write members.
                         logging.info(
-                            f"Rank {rank}: no local members for index {ind}; skipping compute/write"
+                            f"Rank {rank}: no local members for index {ind}; "
+                            "skipping compute/write"
                         )
 
                 # ====================================================
@@ -511,6 +508,8 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                             f"Rank {rank}: moved deterministic forecast to CPU for index {ind}"
                         )
 
+                        # Denormalize only forecast outputs.
+                        # No initial input/analysis field is handled here.
                         denormalize_datasets(
                             ground_truth,
                             output_forecast,
@@ -518,16 +517,9 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                         )
 
                         output_forecast = output_forecast.numpy().astype(np.float64)
-                        ground_truth_np = ground_truth.numpy().astype(np.float64)
 
-                        convert_cartesian_to_spherical_winds(
-                            dataset.lat,
-                            dataset.lon,
-                            cfg,
-                            ground_truth_np,
-                            output_features,
-                        )
-
+                        # Convert only forecast outputs.
+                        # No initial input/analysis field is converted or saved here.
                         convert_cartesian_to_spherical_winds(
                             dataset.lat,
                             dataset.lon,
@@ -543,10 +535,8 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
 
                             save_results_to_zarr(
                                 output_forecast,
-                                dataset.ds_loader,
                                 atmospheric_vars,
                                 surface_vars,
-                                constant_vars,
                                 dataset,
                                 pressure_levels,
                                 rank_output_file,
@@ -561,18 +551,8 @@ def forecast_worker(local_rank: int, cfg_path: str) -> None:
                                 f"Rank {rank}: finished deterministic Zarr write for index {ind}"
                             )
 
-                # ----------------------------------------------------
-                # IMPORTANT:
-                # Do not synchronize after every forecast initialization.
-                # Each rank writes its own Zarr file, so a per-batch barrier
-                # can make fast ranks wait forever if another rank is slow
-                # or stuck in I/O.
-                #
-                # The final synchronization happens in cleanup_distributed().
-                # ----------------------------------------------------
-                # if distributed:
-                #     dist.barrier()
-
+                # No per-batch distributed barrier.
+                # Each rank writes its own Zarr file.
                 ind += 1
                 time_start_ind += batch_size
 
@@ -597,7 +577,7 @@ def main() -> None:
     num_devices = int(cfg.compute.get("num_devices", 1))
 
     # ------------------------------------------------------------
-    # PBS/training-style distributed launch:
+    # PBS/distributed launch:
     # one parent forecast.py per node, each parent spawns local GPUs.
     #
     # Required environment variables:

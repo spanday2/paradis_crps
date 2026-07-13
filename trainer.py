@@ -183,6 +183,7 @@ class LitParadis(L.LightningModule):
             pairwise_coeff = cfg.training.get("crps_pairwise_coeff", None)
             
             self.crps_loss = TwoMemberAlmostFairCRPS(
+            var_loss_weights=var_loss_weights_reordered,
             alpha=alpha,
             pairwise_coeff=pairwise_coeff,
             )
@@ -196,6 +197,7 @@ class LitParadis(L.LightningModule):
                 self.spectral_crps_loss = TwoMemberSpectralAlmostFairCRPS(
                     nlat=self.nlat,
                     nlon=self.nlon,
+                    var_loss_weights=var_loss_weights_reordered,
                     alpha=alpha,
                     pairwise_coeff=pairwise_coeff,
                     grid=spectral_cfg.get("grid", "equiangular"),

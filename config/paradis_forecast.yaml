@@ -18,8 +18,8 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps_2/logs/lightning_logs/cosine/stage2_1e-6/version_22/checkpoints/last.ckpt
-  restart: false
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps_2/logs/lightning_logs/firstFullTraining/FT/version_24/checkpoints/0003000.ckpt
+  restart: False
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
   time_resolution: 6h
@@ -29,7 +29,7 @@ dataset:
 normalization:
   standard: true
 compute:
-  num_nodes: 1
+  num_nodes: 2
   num_devices: 4
   accelerator: gpu
   use_amp: true
@@ -41,7 +41,7 @@ forecast:
   start_date: '2022-01-01'
   end_date: '2022-01-31'
   output_frequency: 1
-  output_file: ./results/cosine/one_deg_stage2_2022_jan.zarr
+  output_file: ./results/wsd/onedeg_FT2022_jan.zarr
 training:
   max_epochs: -1
   max_steps: 300000

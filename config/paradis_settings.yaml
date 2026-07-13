@@ -18,8 +18,8 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_40/checkpoints/last.ckpt
-  restart: true
+  checkpoint_path: null #/home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_40/checkpoints/last.ckpt
+  restart: false
   checkpoint_type: ensemble   # deterministic or ensemble
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/

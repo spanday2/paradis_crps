@@ -10,148 +10,167 @@ import torch_harmonics as th
 
 
 class TwoMemberAlmostFairCRPS(nn.Module):
-    """Two-member almost-fair CRPS.
+    """Two-member almost-fair CRPS with variable and latitude weighting.
 
     For two members, the loss is
-
         0.5 * |x1 - y| + 0.5 * |x2 - y| - 0.5 * C * |x1 - x2|
-
-    where
-
-        eps = (1 - alpha) / 2
-        C   = 1 - eps
-
-    If alpha=1, this gives the fair two-member coefficient C=1.
-
-    If the standard unfair CRPS coefficient for M=2 is desired, set
-    pairwise_coeff=0.5.
     """
 
-    def __init__(self, alpha: float = 0.95, pairwise_coeff: float | None = None):
+    def __init__(
+        self,
+        var_loss_weights: torch.Tensor,
+        lat_grid: torch.Tensor | None = None,
+        alpha: float = 0.95,
+        pairwise_coeff: float | None = None,
+        apply_latitude_weights: bool = False,
+    ):
         super().__init__()
         self.alpha = alpha
         self.pairwise_coeff = pairwise_coeff
+        self.apply_latitude_weights = apply_latitude_weights
+
+        # Register variable weights as buffer for device management
+        self.register_buffer("var_loss_weights", var_loss_weights.float().detach())
+
+        if apply_latitude_weights and lat_grid is not None:
+            self.register_buffer("lat_weights", self._compute_latitude_weights(lat_grid).detach())
+        else:
+            self.lat_weights = None
 
     @property
     def c(self) -> float:
         if self.pairwise_coeff is not None:
             return float(self.pairwise_coeff)
-
         eps = (1.0 - float(self.alpha)) / 2.0
         return 1.0 - eps
 
-    @staticmethod
-    def _mean_abs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.mean(torch.abs(a - b))
+    def _compute_latitude_weights(self, grid_lat_deg: torch.Tensor) -> torch.Tensor:
+        """GraphCast-consistent latitude weights (unit-mean)."""
+        lat = grid_lat_deg.to(dtype=torch.float64)
+        if lat.ndim != 1:
+            raise ValueError(f"grid_lat_deg must be 1D [H], got {lat.shape}")
+
+        d = lat[1:] - lat[:-1]
+        d0 = d[0]
+        if not torch.allclose(d, d0.expand_as(d), rtol=0.0, atol=1e-6):
+            raise ValueError("Latitude grid is not uniformly spaced.")
+
+        delta = torch.abs(d0)
+        lat_min = torch.min(lat)
+        lat_max = torch.max(lat)
+
+        has_poles = torch.isclose(
+            lat_min, lat.new_tensor(-90.0), atol=1e-6
+        ) and torch.isclose(lat_max, lat.new_tensor(90.0), atol=1e-6)
+
+        if has_poles:
+            lat_rad = torch.deg2rad(lat)
+            delta_rad = torch.deg2rad(delta)
+            weights = torch.cos(lat_rad) * torch.sin(delta_rad / 2.0)
+            pole_w = torch.sin(delta_rad / 4.0) ** 2
+            weights[torch.argmin(lat)] = pole_w
+            weights[torch.argmax(lat)] = pole_w
+        else:
+            weights = torch.cos(torch.deg2rad(lat))
+
+        weights = weights / weights.mean()
+        return weights.to(dtype=grid_lat_deg.dtype)
+
+    def _weighted_mean_abs(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Computes the weighted mean absolute difference across B, C, Lat, Lon."""
+        # Shape: [B, C, Lat, Lon]
+        abs_diff = torch.abs(a - b)
+        
+        # Apply variable weights: broadcast to [1, C, 1, 1]
+        var_weights = self.var_loss_weights.view(1, -1, 1, 1)
+        abs_diff = abs_diff * var_weights
+
+        # Apply latitude weights: broadcast to [1, 1, Lat, 1]
+        if self.apply_latitude_weights and self.lat_weights is not None:
+            lat_weights = self.lat_weights.view(1, 1, -1, 1)
+            abs_diff = abs_diff * lat_weights
+
+        return torch.mean(abs_diff)
 
     def fit_term(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self._mean_abs(x, y)
+        return 0.5 * self._weighted_mean_abs(x, y)
 
     def spread_term(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self.c * self._mean_abs(x1, x2)
+        return 0.5 * self.c * self._weighted_mean_abs(x1, x2)
 
     def full_loss_for_logging(
-        self,
-        x1: torch.Tensor,
-        x2: torch.Tensor,
-        y: torch.Tensor,
+        self, x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fit = self.fit_term(x1, y) + self.fit_term(x2, y)
         spread = self.spread_term(x1, x2)
         loss = fit - spread
         return loss, fit, spread
-    
+
+
 class TwoMemberSpectralAlmostFairCRPS(nn.Module):
-    """Two-member almost-fair afCRPS in spectral space.
+    """Two-member almost-fair afCRPS in spectral space with variable weighting.
 
-    This computes afCRPS after applying spherical harmonic transform
-    channel-by-channel.
-
-    It computes afCRPS per channel and spectral mode, then averages.
-
-    For two members:
-
-        0.5 * |x1_hat - y_hat|
-      + 0.5 * |x2_hat - y_hat|
-      - 0.5 * C * |x1_hat - x2_hat|
-
-    where _hat indicates complex SHT coefficients.
+    Latitude weighting is omitted here as geometry is handled by the SHT.
     """
 
     def __init__(
         self,
         nlat: int,
         nlon: int,
+        var_loss_weights: torch.Tensor,
         alpha: float = 0.95,
         pairwise_coeff: float | None = None,
         grid: str = "equiangular",
     ):
         super().__init__()
-
         self.nlat = nlat
         self.nlon = nlon
         self.alpha = alpha
         self.pairwise_coeff = pairwise_coeff
 
+        self.register_buffer("var_loss_weights", var_loss_weights.float().detach())
         self.sht = th.RealSHT(nlat, nlon, grid=grid)
 
     @property
     def c(self) -> float:
         if self.pairwise_coeff is not None:
             return float(self.pairwise_coeff)
-
         eps = (1.0 - float(self.alpha)) / 2.0
         return 1.0 - eps
 
     def _sht_coeffs(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply RealSHT to each channel independently.
-
-        Input:
-            x: B, C, lat, lon
-
-        Output:
-            coeffs: B, C, L, M
-        """
         B, C, lat, lon = x.shape
-
         if lat != self.nlat or lon != self.nlon:
-            raise ValueError(
-                f"Expected spatial shape ({self.nlat}, {self.nlon}), "
-                f"got ({lat}, {lon})."
-            )
+            raise ValueError(f"Expected spatial shape ({self.nlat}, {self.nlon}), got ({lat}, {lon}).")
 
-        # RealSHT is safer in float32 under AMP/bfloat16.
         x_2d = x.float().reshape(B * C, lat, lon)
-
         coeffs = self.sht(x_2d)
+        return coeffs.reshape(B, C, coeffs.shape[-2], coeffs.shape[-1])
 
-        coeffs = coeffs.reshape(B, C, coeffs.shape[-2], coeffs.shape[-1])
-
-        return coeffs
-
-    def _mean_abs_coeff(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Mean absolute difference of complex spectral coefficients."""
+    def _weighted_mean_abs_coeff(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Mean absolute difference of complex spectral coefficients with channel weighting."""
         a_hat = self._sht_coeffs(a)
         b_hat = self._sht_coeffs(b)
-
-        return torch.mean(torch.abs(a_hat - b_hat))
+        
+        # Shape: [B, C, L, M]
+        abs_diff = torch.abs(a_hat - b_hat)
+        
+        # Apply variable weights: broadcast to [1, C, 1, 1]
+        var_weights = self.var_loss_weights.view(1, -1, 1, 1)
+        return torch.mean(abs_diff * var_weights)
 
     def fit_term(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self._mean_abs_coeff(x, y)
+        return 0.5 * self._weighted_mean_abs_coeff(x, y)
 
     def spread_term(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self.c * self._mean_abs_coeff(x1, x2)
+        return 0.5 * self.c * self._weighted_mean_abs_coeff(x1, x2)
 
     def full_loss_for_logging(
-        self,
-        x1: torch.Tensor,
-        x2: torch.Tensor,
-        y: torch.Tensor,
+        self, x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         fit = self.fit_term(x1, y) + self.fit_term(x2, y)
         spread = self.spread_term(x1, x2)
         loss = fit - spread
-
         return loss, fit, spread
 
 

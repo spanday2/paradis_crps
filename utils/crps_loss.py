@@ -192,7 +192,19 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
         b: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute the full-order spectral absolute-coefficient difference.
+        Compute the full-order absolute difference between spectral
+        coefficient magnitudes.
+
+        For each spherical-harmonic mode, this computes:
+
+            abs(abs(SHT(a)) - abs(SHT(b)))
+
+        rather than:
+
+            abs(SHT(a) - SHT(b))
+
+        Therefore, the loss compares spectral amplitudes and ignores
+        spectral phase differences.
 
         RealSHT stores only m >= 0. The omitted negative orders are
         included through multiplicity weights:
@@ -202,26 +214,40 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
             m > ell -> weight 0
 
         The spectral dimensions L and M are summed. The result is averaged
-        only over batch and variables, then divided by 4*pi before the
-        external spectral loss weight is applied.
+        over batch and variables, then divided by 4*pi before the external
+        spectral loss weight is applied.
         """
         a_hat = self._sht_coeffs(a)
         b_hat = self._sht_coeffs(b)
 
-        # Shape: [B, C, L, M]
-        abs_diff = torch.abs(a_hat - b_hat)
+        # Convert complex SHT coefficients to non-negative amplitudes.
+        a_amplitude = torch.abs(a_hat)
+        b_amplitude = torch.abs(b_hat)
+
+        # Compare spectral amplitudes:
+        #
+        #     ||a_hat| - |b_hat||
+        #
+        # instead of:
+        #
+        #     |a_hat - b_hat|
+        abs_diff = torch.abs(
+            a_amplitude - b_amplitude
+        )
 
         B, C, L, M = abs_diff.shape
 
-        # Shape: [1, C, 1, 1]
+        # Variable weights: [1, C, 1, 1]
         var_weights = self.var_loss_weights.to(
             device=abs_diff.device,
             dtype=abs_diff.dtype,
         ).view(1, C, 1, 1)
 
-        # Shape: [L, M]
+        # RealSHT multiplicity weights: [L, M]
         #
-        # m=0 is counted once, m>0 twice, and m>ell is excluded.
+        # m = 0 is counted once.
+        # m > 0 is counted twice.
+        # m > ell is excluded.
         mode_weights = self._make_real_sht_mode_weights(
             L=L,
             M=M,
@@ -235,15 +261,15 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
             * mode_weights.view(1, 1, L, M)
         )
 
-        # Sum over L and M.
-        # Average only over B and C.
+        # Sum over spectral modes.
+        # Average over batch and variables.
         full_spectral_afcrps_distance = (
             weighted_abs_diff
             .sum(dim=(-2, -1))
             .mean()
         )
 
-        # Normalize before multiplication by spectral_crps_weight.
+        # Apply one spherical normalization factor.
         four_pi = full_spectral_afcrps_distance.new_tensor(
             4.0 * math.pi
         )

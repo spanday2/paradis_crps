@@ -1,9 +1,9 @@
 #PBS -S /bin/bash
-#PBS -N ens_spherical_grf
+#PBS -N ens_spectral_crps_lambda0p1
 #PBS -l select=4:ncpus=48:mpiprocs=4:ngpus=4:mem=437G:vntype=gpu
 #PBS -l walltime=12:00:00
-#PBS -o ens_grf_noise.log
-#PBS -e ens_grf_noise_error.log
+#PBS -o ens_spectral_crps_lambda0p1.log
+#PBS -e ens_spectral_crps_lambda0p1_error.log
 
 export MASTER_PORT=8148
 NODES=$(cat $PBS_NODEFILE | sort | uniq)

@@ -56,7 +56,7 @@ training:
   crps_alpha: 0.95
   conditioning_catchup_steps: 0
   spectral_crps:
-    weight: 0 #put zero to turn off spectral afCRPS
+    weight: 0.1 #put zero to turn off spectral afCRPS
     grid: equiangular
   dataset:
     start_date: '1990-01-01'

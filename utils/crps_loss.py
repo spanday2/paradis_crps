@@ -3,7 +3,7 @@
 This file contains the two-member almost-fair CRPS loss and the
 memory-efficient streaming training/validation routines used by LitParadis.
 """
-
+import math
 import torch
 import torch.nn as nn
 import torch_harmonics as th
@@ -109,8 +109,6 @@ class TwoMemberAlmostFairCRPS(nn.Module):
 
 class TwoMemberSpectralAlmostFairCRPS(nn.Module):
     """Two-member almost-fair afCRPS in spectral space with variable weighting.
-
-    Latitude weighting is omitted here as geometry is handled by the SHT.
     """
 
     def __init__(
@@ -129,7 +127,7 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
         self.pairwise_coeff = pairwise_coeff
 
         self.register_buffer("var_loss_weights", var_loss_weights.float().detach())
-        self.sht = th.RealSHT(nlat, nlon, grid=grid)
+        self.sht = th.RealSHT(nlat, nlon, grid=grid, norm="ortho")
 
     @property
     def c(self) -> float:
@@ -146,18 +144,112 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
         x_2d = x.float().reshape(B * C, lat, lon)
         coeffs = self.sht(x_2d)
         return coeffs.reshape(B, C, coeffs.shape[-2], coeffs.shape[-1])
+    
+    def _make_real_sht_mode_weights(
+        self,
+        L: int,
+        M: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Construct full-order weights for RealSHT coefficients.
 
-    def _weighted_mean_abs_coeff(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Mean absolute difference of complex spectral coefficients with channel weighting."""
+        RealSHT stores only nonnegative orders m >= 0.
+
+            m = 0   -> weight 1
+            m > 0   -> weight 2
+            m > ell -> weight 0
+        """
+        ell = torch.arange(
+            L,
+            device=device,
+        ).view(L, 1)
+
+        m = torch.arange(
+            M,
+            device=device,
+        ).view(1, M)
+
+        valid = m <= ell
+
+        mode_weights = torch.ones(
+            (L, M),
+            device=device,
+            dtype=dtype,
+        )
+
+        if M > 1:
+            mode_weights[:, 1:] = 2.0
+
+        mode_weights = mode_weights * valid.to(dtype)
+
+        return mode_weights
+
+    def _weighted_mean_abs_coeff(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the full-order spectral absolute-coefficient difference.
+
+        RealSHT stores only m >= 0. The omitted negative orders are
+        included through multiplicity weights:
+
+            m = 0   -> weight 1
+            m > 0   -> weight 2
+            m > ell -> weight 0
+
+        The spectral dimensions L and M are summed. The result is averaged
+        only over batch and variables, then divided by 4*pi before the
+        external spectral loss weight is applied.
+        """
         a_hat = self._sht_coeffs(a)
         b_hat = self._sht_coeffs(b)
-        
+
         # Shape: [B, C, L, M]
         abs_diff = torch.abs(a_hat - b_hat)
-        
-        # Apply variable weights: broadcast to [1, C, 1, 1]
-        var_weights = self.var_loss_weights.view(1, -1, 1, 1)
-        return torch.mean(abs_diff * var_weights)
+
+        B, C, L, M = abs_diff.shape
+
+        # Shape: [1, C, 1, 1]
+        var_weights = self.var_loss_weights.to(
+            device=abs_diff.device,
+            dtype=abs_diff.dtype,
+        ).view(1, C, 1, 1)
+
+        # Shape: [L, M]
+        #
+        # m=0 is counted once, m>0 twice, and m>ell is excluded.
+        mode_weights = self._make_real_sht_mode_weights(
+            L=L,
+            M=M,
+            device=abs_diff.device,
+            dtype=abs_diff.dtype,
+        )
+
+        weighted_abs_diff = (
+            abs_diff
+            * var_weights
+            * mode_weights.view(1, 1, L, M)
+        )
+
+        # Sum over L and M.
+        # Average only over B and C.
+        full_spectral_afcrps_distance = (
+            weighted_abs_diff
+            .sum(dim=(-2, -1))
+            .mean()
+        )
+
+        # Normalize before multiplication by spectral_crps_weight.
+        four_pi = full_spectral_afcrps_distance.new_tensor(
+            4.0 * math.pi
+        )
+
+        return full_spectral_afcrps_distance / four_pi
+
 
     def fit_term(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return 0.5 * self._weighted_mean_abs_coeff(x, y)
@@ -172,7 +264,8 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
         spread = self.spread_term(x1, x2)
         loss = fit - spread
         return loss, fit, spread
-
+    
+    
 
 def two_member_afcrps_training_step(
     litmodel,

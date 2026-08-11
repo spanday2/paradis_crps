@@ -65,7 +65,7 @@ dataset:
   prediction_delta: 6h             # Prediction will be done at t+prediction_delta
 
 normalization:
-  standard: False                  # (True = z-score normalization to all variables, False = custom norms)
+  standard: true                   # (True = z-score normalization to all variables, False = custom norms)
 
 # Compute/hardware aspects
 compute:
@@ -114,7 +114,7 @@ training:
     validation_batches: null       # If non-null, use N batches rather than all for validation (0 disables val)
 
   optimizer:
-    name: normuon                  # Choose among [adamw, muon, normuon]
+    name: adamw                  # Choose among [adamw, muon, normuon]
     lr: 5e-4                       # Learning rate (LR) for the optimizer
     weight_decay: 1.e-2            # Weight decay coefficient for regularization
     beta1: 0.9                     # Exponential decay rate for the first moment (gradient) estimates

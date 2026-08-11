@@ -511,7 +511,6 @@ class LitParadis(L.LightningModule):
         num_steps = true_data.size(1)
 
         train_loss_for_logging = 0.0
-        train_loss_reference = 0.0
         chunk_loss = 0.0
 
         detach_every_n = self.detach_gradient_every
@@ -616,25 +615,14 @@ class LitParadis(L.LightningModule):
                 sync_dist=True,
             )
 
-            train_loss_reference = train_loss_reference / num_steps
-            self.log(
-                "train_loss",
-                train_loss_reference,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=True,
-                sync_dist=True,
-            )
-
-        else:
-            self.log(
-                "train_loss",
-                train_loss,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=True,
-                sync_dist=True,
-            )
+        self.log(
+            "train_loss",
+            train_loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            sync_dist=True,
+        )
 
         self.log("lr", opt.param_groups[0]["lr"], prog_bar=True)
 

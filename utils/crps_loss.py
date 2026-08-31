@@ -143,6 +143,8 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
 
         x_2d = x.float().reshape(B * C, lat, lon)
         coeffs = self.sht(x_2d)
+        # FCN3-style coefficient normalization.
+        coeffs = coeffs / math.sqrt(4.0 * math.pi)
         return coeffs.reshape(B, C, coeffs.shape[-2], coeffs.shape[-1])
     
     def _make_real_sht_mode_weights(
@@ -232,7 +234,7 @@ class TwoMemberSpectralAlmostFairCRPS(nn.Module):
         #
         #     |a_hat - b_hat|
         abs_diff = torch.abs(
-            a_amplitude - b_amplitude
+            a_hat - b_hat
         )
 
         B, C, L, M = abs_diff.shape

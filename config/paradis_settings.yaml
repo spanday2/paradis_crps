@@ -18,9 +18,9 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/saz001/ss8/paradis/released_versions/1_deg/v1.01/01/phase_1/logs/r4/checkpoints/last.ckpt
-  restart: false
-  checkpoint_type: deterministic   # deterministic or ensemble
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_15/checkpoints/last.ckpt
+  restart: true
+  checkpoint_type: ensemble   # deterministic or ensemble
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
   time_resolution: 6h
@@ -45,18 +45,18 @@ forecast:
   output_file: ./results/FT_LT72h_with_24hrWeights_2022.zarr/
 training:
   max_epochs: -1
-  max_steps: 5000
+  max_steps: 400000
   progress_bar: true
   gradient_clip_val: null
   print_losses: false
   log_every_n_steps: 100
   log_dir: logs
-  experiment_name: "lambda0p1"
+  experiment_name: null
   num_ensemble_members: 2
   crps_alpha: 0.95
-  conditioning_catchup_steps: 5000
+  conditioning_catchup_steps: 0
   spectral_crps:
-    weight: 0.1 #put zero to turn off spectral afCRPS
+    weight: 0 #put zero to turn off spectral afCRPS
     grid: equiangular
   dataset:
     start_date: '1990-01-01'
@@ -99,7 +99,7 @@ training:
     wsd:
       enabled: true
       warmup: 1000
-      decay: 0
+      decay: 0.2
   variable_loss_weights:
     atmospheric:
       wind_x: 1.0

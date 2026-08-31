@@ -25,11 +25,11 @@ echo "OMP_NUM_THREADS is: $OMP_NUM_THREADS"
 PY=/home/shp000/site8/conda/miniforge3/envs/paradis/bin/python
 CODEDIR=/home/shp000/site7/ensemble/paradis_crps
 
-FIRST_CKPT=/home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_33/checkpoints/0003000.ckpt
+FIRST_CKPT=/home/shp000/site7/ensemble/paradis_crps_2/logs/lightning_logs/firstFullTraining/FT/version_24/checkpoints/0003000.ckpt
 
 PREV_CKPT="$FIRST_CKPT"
 
-for FS in 10 12; do
+for FS in 2 4 6 8 10 12; do
 
     EXP="ens_1deg_stage_${FS}"
 

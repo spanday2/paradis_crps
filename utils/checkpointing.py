@@ -50,9 +50,6 @@ def load_ensemble_checkpoint(litmodel, checkpoint_path: str) -> None:
     state_dict = read_checkpoint_state_dict(checkpoint_path)
     litmodel.load_state_dict(state_dict, strict=True)
 
-    if litmodel.global_rank == 0:
-        logging.info(f"Loaded ensemble checkpoint from: {checkpoint_path}")
-
 
 def load_deterministic_checkpoint_into_ensemble(
     litmodel,

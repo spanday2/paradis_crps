@@ -18,7 +18,7 @@ model:
   noise_mlp_hidden_dim: 32
 init:
   seed: 42
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps_2/logs/lightning_logs/firstFullTraining/FT/version_24/checkpoints/0003000.ckpt
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps_2/logs/lightning_logs/firstFullTraining/stage1_300k/version_18/checkpoints/last.ckpt
   restart: False
 dataset:
   root_dir: /home/cap003/site7/datasets/era5_1deg_13level/
@@ -41,7 +41,7 @@ forecast:
   start_date: '2022-01-01'
   end_date: '2022-01-31'
   output_frequency: 1
-  output_file: ./results/wsd/onedeg_FT2022_jan.zarr
+  output_file: ./results/deterministic300k/onedeg_2022_jan.zarr
 training:
   max_epochs: -1
   max_steps: 300000
@@ -54,7 +54,7 @@ training:
   num_ensemble_members: 8
   crps_alpha: 0.95
   spectral_crps:
-    weight: 0.1 #put zero to turn off spectral afCRPS
+    weight: 0 #put zero to turn off spectral afCRPS
     grid: equiangular
   dataset:
     start_date: '2000-01-01'

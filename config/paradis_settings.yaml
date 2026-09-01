@@ -11,6 +11,9 @@ model:
   coarsening_factor: 1             # Coarsens the processor grid by this factor
   val_forecast_steps: ${model.forecast_steps}
 
+  # Probabilistic ensemble
+  noise_channels: 4                # Number of stochastic noise channels supplied to Paradis
+
   # Physics block
   # Specify blocks for each layer. If layer has length of 1, hidden_dim is ignored.
   physblock:
@@ -101,6 +104,17 @@ training:
   log_additional_stats: false      # Prints gradient-related metrics for debugging
   accumulate_grad_batches: 1       # Increase effective global batch size by this factor
 
+  # Probabilistic ensemble training
+  num_ensemble_members: 2          # Two-member ensemble used for afCRPS training
+  crps_alpha: 0.95                 # Almost-fair CRPS correction parameter
+  crps_pairwise_coeff: null        # Optional explicit pairwise coefficient; null derives it from alpha
+
+  # Optional spectral afCRPS
+  spectral_crps:
+    weight: 0.0                    # 0 disables spectral CRPS; e.g. 0.1 adds spectral term to training objective
+    grid: equiangular              # Spherical harmonic grid
+
+
   dataset:
     start_date: 1979-01-02         # Start date for the training dataset (YYYY-MM-DD)
     end_date: 2019-12-31           # End date for the training dataset (YYYY-MM-DD)
@@ -119,17 +133,14 @@ training:
     weight_decay: 1.e-2            # Weight decay coefficient for regularization
     beta1: 0.9                     # Exponential decay rate for the first moment (gradient) estimates
     beta2: 0.95                    # Exponential decay rate for the second moment (squared gradient) estimates
-    detach_gradient_every: null    # Detach gradient every N steps for finetuning
 
   early_stopping:
     enabled: false                 # Whether to use early stopping
     patience: 8                    # Number of epochs with no improvement after which training will stop
 
   loss_function:
-    type: "reversed_huber"         # mse, reversed_huber or dyn_reversed_huber loss functions
     delta_loss: 1.0                # Threshold parameter for huber loss
     lat_weights: true             # Integrate loss with spherical metrics
-    validation_loss: null          # Specify if a different score should be used for validation
 
   checkpointing:
     enabled: true                  # Enable checkpointing

@@ -55,6 +55,13 @@ def parse_args():
     parser.add_argument(
         "--num-workers", type=int, default=1, help="Number of dataloader workers"
     )
+    
+    parser.add_argument(
+        "--num-ensemble-members",
+        type=int,
+        default=8,
+        help="Number of stochastic ensemble members",
+    )
 
     return parser.parse_args()
 
@@ -62,12 +69,19 @@ def parse_args():
 def main():
 
     args = parse_args()
+    
+    if args.num_ensemble_members <= 0:
+        raise ValueError("--num-ensemble-members must be > 0")
+
+    if args.flush_every_n_steps <= 0:
+        raise ValueError("--flush-every-n-steps must be > 0")
 
     cfg = OmegaConf.load(args.config)
     cfg.forecast.enable = True
 
     cfg.init.checkpoint_path = args.checkpoint_path
     cfg.forecast.output_file = args.output_file
+    cfg.forecast.num_ensemble_members = args.num_ensemble_members
 
     if args.root_dir is not None:
         cfg.dataset.root_dir = args.root_dir
@@ -88,9 +102,6 @@ def main():
     # Only supporting single node for now
     cfg.compute.num_nodes = 1
 
-    # Restart continues the training from the current step
-    cfg.init.restart = True
-
     datamodule = Era5DataModule(cfg)
     datamodule.setup(stage="predict")
 
@@ -109,7 +120,6 @@ def main():
         model,
         datamodule=datamodule,
         return_predictions=False,
-        ckpt_path=cfg.init.checkpoint_path,
     )
 
 

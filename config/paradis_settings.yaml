@@ -13,6 +13,7 @@ model:
 
   # Probabilistic ensemble
   noise_channels: 4                # Number of stochastic noise channels supplied to Paradis
+  noise_mlp_hidden_dim: 32
 
   # Physics block
   # Specify blocks for each layer. If layer has length of 1, hidden_dim is ignored.
@@ -90,6 +91,7 @@ forecast:
   output_frequency: 1              # Store to file every output_frequency forecast steps
   output_file: null                # Name of output forecast file
   write_every_n: 1                 # Write forecast every n steps
+  num_ensemble_members: 20
 
 # Training parameters
 training:

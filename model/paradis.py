@@ -27,6 +27,26 @@ def _get_activation_cls(name: str) -> type[nn.Module]:
         )
     return _ACTIVATIONS[name]
 
+class NoiseEmbedding(nn.Module):
+    """Pointwise embedding of raw Gaussian noise."""
+
+    def __init__(self, noise_channels: int, emb_dim: int):
+        super().__init__()
+
+        self.noise_channels = noise_channels
+        self.emb_dim = emb_dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(noise_channels, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+        self.norm = nn.LayerNorm(emb_dim)
+
+    def forward(self, noise: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.mlp(noise))
+
 
 class Paradis(nn.Module):
     """Paradis model adapted for shallow water equations."""
@@ -40,6 +60,15 @@ class Paradis(nn.Module):
         mesh_size = (self.nlat, self.nlon)
 
         hidden_dim = cfg.model.get("latent_size")
+        
+        self.noise_channels = cfg.model.noise_channels
+        self.noise_mlp_hidden_dim = cfg.model.get("noise_mlp_hidden_dim", 32)
+        self.noise_dim = self.noise_mlp_hidden_dim
+
+        if self.noise_channels <= 0:
+            raise ValueError(f"Probabilistic Paradis requires noise_channels > 0, got {self.noise_channels}.")
+
+        self.noise_embedding = NoiseEmbedding(self.noise_channels, self.noise_dim)
 
         self.num_vels = cfg.model.get("velocity_vectors")
 
@@ -59,15 +88,8 @@ class Paradis(nn.Module):
         self.num_common_features = datamodule.num_common_features
         self.n_inputs = cfg.dataset.n_time_inputs
 
-        # Wrapper for gradient checkpointing
-        self.step_fn = self._layer_step
+        # Gradient checkpointing
         self.gradient_checkpoint = cfg.compute.get("gradient_checkpointing", False)
-
-
-        if self.gradient_checkpoint:
-            self.step_fn = lambda i, h, hs: checkpoint(
-                self._layer_step, i, h, hs, use_reentrant=False
-            )
 
         input_layers = cfg.model.physblock.input_proj.layers
         vnet_layers = cfg.model.physblock.velocity_net.layers
@@ -113,6 +135,7 @@ class Paradis(nn.Module):
                     bias_channels=bias_channels,
                     activation_fn=self.activation_function,
                     pre_normalize=True,
+                    noise_dim=self.noise_dim,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -144,6 +167,7 @@ class Paradis(nn.Module):
                     pre_normalize=True,
                     activation_fn=self.activation_function,
                     bias_channels=bias_channels,
+                    noise_dim=self.noise_dim,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -160,6 +184,7 @@ class Paradis(nn.Module):
                     pre_normalize=True,
                     activation_fn=self.activation_function,
                     bias_channels=bias_channels,
+                    noise_dim=self.noise_dim,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -175,6 +200,7 @@ class Paradis(nn.Module):
             activation=False,
             activation_fn=self.activation_function,
             bias_channels=bias_channels,
+            noise_dim=0,
         )
 
         self.alpha_adv = nn.Parameter(torch.full((self.num_layers, hidden_dim), -1.0))
@@ -198,13 +224,6 @@ class Paradis(nn.Module):
         self.input_proj = torch.compile(self.input_proj)
         self.output_proj = torch.compile(self.output_proj)
 
-        if self.gradient_checkpoint:
-            self.step_fn = lambda i, h, hs: checkpoint(
-                self._layer_step, i, h, hs, use_reentrant=False
-            )
-        else:
-            self.step_fn = self._layer_step
-
     def upsample(self, x: torch.Tensor) -> torch.Tensor:
         # Make longitude explicitly periodic before interpolation
         x_ext = torch.cat([x, x[..., :1]], dim=-1)
@@ -220,19 +239,21 @@ class Paradis(nn.Module):
         return y_ext[..., :-1]
 
     def _apply_checkpoint(self, func, *args):
-        if self.gradient_checkpoint:
+        if self.training and self.gradient_checkpoint:
             return checkpoint(func, *args, use_reentrant=False)
-        else:
-            return func(*args)
+        return func(*args)
+    
+    def _step(self, i: int, hidden: torch.Tensor, hidden_static: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
+        if self.training and self.gradient_checkpoint:
+            return checkpoint(self._layer_step, i, hidden, hidden_static, noise_emb, use_reentrant=False)
+        return self._layer_step(i, hidden, hidden_static, noise_emb)
 
-    def _layer_step(
-        self, i: int, hidden: torch.Tensor, hidden_static: torch.Tensor
-    ) -> torch.Tensor:
+    def _layer_step(self, i: int, hidden: torch.Tensor, hidden_static: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
         """Single physics-informed latent update."""
         B = hidden.shape[0]
 
         # Predict latent velocities (u, v) for advection
-        velocities_raw = self.velocity_nets[i](hidden)
+        velocities_raw = self.velocity_nets[i](hidden, noise_emb)
         velocities = velocities_raw.view(B, 2, self.num_vels, self.nlat_coarse, self.nlon_coarse)
         u, v = velocities[:, 0], velocities[:, 1]
 
@@ -243,17 +264,17 @@ class Paradis(nn.Module):
         hidden = hidden + g_adv * (advected - hidden)
 
         # Mixing: Learned diffusion
-        hidden = hidden + self.diffusion[i](hidden)
+        hidden = hidden + self.diffusion[i](hidden, noise_emb)
 
         # Add static features
         hidden_reac = torch.cat([hidden, hidden_static], dim=1)
 
         # Forcing: Pointwise reaction (primary nonlinearity)
-        hidden = hidden + self.reaction[i](hidden_reac)
+        hidden = hidden + self.reaction[i](hidden_reac, noise_emb)
 
         return hidden
 
-    def forward(self, fields):
+    def forward(self, fields: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
         hidden = self._apply_checkpoint(self.input_proj, fields)
         hidden_static = self._apply_checkpoint(
             self.static_encoder, fields[:, -self.n_static:])
@@ -261,9 +282,10 @@ class Paradis(nn.Module):
         skip = hidden
         hidden = self.downsample(hidden)
         hidden_static = self.downsample(hidden_static)
+        noise_emb = self.downsample(noise_emb)
 
         for i in range(self.num_layers):
-            hidden = self.step_fn(i, hidden, hidden_static)
+            hidden = self._step(i, hidden, hidden_static, noise_emb)
 
         hidden = self.upsample(hidden) + skip
         return self._apply_checkpoint(self.output_proj, hidden)

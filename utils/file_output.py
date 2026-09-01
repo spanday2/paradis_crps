@@ -73,7 +73,7 @@ def _build_dataset_for_samples(
     Build an xarray.Dataset for a batch of samples.
 
     Args:
-        forecast: numpy array [B, T_forecast, F, Lat, Lon]
+        forecast: numpy array [B, M, T_forecast, F, Lat, Lon]
         init_times: numpy array [B] of datetimes, already sorted in ascending time order
     """
     atmospheric_vars, surface_vars = _replace_variable_names(cfg)
@@ -88,9 +88,12 @@ def _build_dataset_for_samples(
     input_data = dataset.ds_loader.sel(time=init_times).sortby("time")["data"].values
     input_data = input_data.transpose(0, 3, 1, 2)  # [B, F_in, Lat, Lon]
 
+    num_members = forecast.shape[1]
+
     init_data = numpy.full(
         (
             input_data.shape[0],
+            num_members,
             1,
             len(output_features),
             input_data.shape[2],
@@ -105,20 +108,21 @@ def _build_dataset_for_samples(
     for out_idx, feature in enumerate(output_features):
         in_idx = input_feature_to_idx.get(feature)
         if in_idx is not None:
-            init_data[:, 0, out_idx] = input_data[:, in_idx]
+            init_data[:, :, 0, out_idx] = input_data[:, None, in_idx]
 
-    convert_cartesian_to_spherical_winds(
-        dataset.lat,
-        dataset.lon,
-        cfg,
-        init_data,
-        output_features,
-    )
+    for member in range(num_members):
+        convert_cartesian_to_spherical_winds(
+            dataset.lat,
+            dataset.lon,
+            cfg,
+            init_data[:, member],
+            output_features,
+        )
 
     output_feature_to_idx = {name: i for i, name in enumerate(output_features)}
 
     # Atmospheric variables
-    atm_dims = ["time", "prediction_timedelta", "level", "latitude", "longitude"]
+    atm_dims = ["time", "member", "prediction_timedelta", "level", "latitude", "longitude",]
     for in_feature, out_feature in zip(cfg.features.output.atmospheric, atmospheric_vars):
         feature_indices = [
             output_feature_to_idx[f"{in_feature}_h{level}"] for level in pressure_levels
@@ -128,32 +132,33 @@ def _build_dataset_for_samples(
             atm_dims,
             numpy.concatenate(
                 (
-                    init_data[:, :, feature_indices],
-                    forecast[:, :, feature_indices],
+                    init_data[:, :, :, feature_indices],
+                    forecast[:, :, :, feature_indices],
                 ),
-                axis=1,
+                axis=2,
             ),
         )
 
     # Surface variables
-    sur_dims = ["time", "prediction_timedelta", "latitude", "longitude"]
+    sur_dims = ["time", "member", "prediction_timedelta", "latitude", "longitude",]
     for in_feature, out_feature in zip(cfg.features.output.surface, surface_vars):
         if in_feature == "wind_z_10m":
             continue
 
         feature_idx = output_feature_to_idx[in_feature]
+
         data_vars[out_feature] = (
             sur_dims,
             numpy.concatenate(
                 (
-                    init_data[:, :, feature_idx],
-                    forecast[:, :, feature_idx],
+                    init_data[:, :, :, feature_idx],
+                    forecast[:, :, :, feature_idx],
                 ),
-                axis=1,
+                axis=2,
             ),
         )
 
-    ds = xarray.Dataset(data_vars=data_vars)
+    ds = xarray.Dataset(data_vars=data_vars, coords={"member": numpy.arange(num_members),},)
 
     # Cast time-varying vars to float32
     for v in list(ds.data_vars):
@@ -197,11 +202,13 @@ def _build_template_dataset(cfg, dataset):
     n_time = len(sorted_times)
     n_lat = dataset.lat_size
     n_lon = dataset.lon_size
+    n_member = int(cfg.forecast.num_ensemble_members)
 
     coords = {
         "latitude": dataset.lat,
         "longitude": dataset.lon,
         "time": sorted_times,
+        "member": numpy.arange(n_member),
         "level": pressure_levels,
         "prediction_timedelta": numpy.arange(output_num_forecast_steps + 1)
         * numpy.timedelta64(dataset.time_resolution * 3600 * 10**9, "ns"),
@@ -210,18 +217,18 @@ def _build_template_dataset(cfg, dataset):
     data_vars = {}
 
     # Atmospheric variables
-    atm_dims = ["time", "prediction_timedelta", "level", "latitude", "longitude"]
-    atm_shape = (n_time, total_pred_steps, num_levels, n_lat, n_lon)
-    atm_chunks = (1, min(10, total_pred_steps), num_levels, n_lat, n_lon)
+    atm_dims = ["time", "member", "prediction_timedelta", "level", "latitude", "longitude"]
+    atm_shape = (n_time, n_member, total_pred_steps, num_levels, n_lat, n_lon)
+    atm_chunks = (1, 1, min(10, total_pred_steps), num_levels, n_lat, n_lon)
 
     for feature in atmospheric_vars:
         arr = da.empty(atm_shape, chunks=atm_chunks, dtype=numpy.float32)
         data_vars[feature] = (atm_dims, arr)
 
     # Surface variables
-    sur_dims = ["time", "prediction_timedelta", "latitude", "longitude"]
-    sur_shape = (n_time, total_pred_steps, n_lat, n_lon)
-    sur_chunks = (1, min(10, total_pred_steps), n_lat, n_lon)
+    sur_dims = ["time", "member", "prediction_timedelta", "latitude", "longitude"]
+    sur_shape = (n_time, n_member, total_pred_steps, n_lat, n_lon)
+    sur_chunks = (1, 1, min(10, total_pred_steps), n_lat, n_lon)
 
     for feature in surface_vars:
         if feature == "wind_z_10m":
@@ -254,9 +261,20 @@ def _build_template_dataset(cfg, dataset):
 
     for var in ds.data_vars:
         if "time" in ds[var].dims:
-            var_shape = ds[var].shape
+            chunks = []
+
+            for dim in ds[var].dims:
+                if dim == "time":
+                    chunks.append(1)
+                elif dim == "member":
+                    chunks.append(1)
+                elif dim == "prediction_timedelta":
+                    chunks.append(min(10, ds[var].sizes[dim]))
+                else:
+                    chunks.append(ds[var].sizes[dim])
+
             encoding[var] = {
-                "chunks": (1, min(10, var_shape[1]), *var_shape[2:]),
+                "chunks": tuple(chunks),
             }
 
             if ds[var].dtype.kind == "f":
@@ -265,6 +283,7 @@ def _build_template_dataset(cfg, dataset):
                 encoding[var].update(_enc_uint8())
             else:
                 encoding[var].update({"compressor": compressor, "dtype": ds[var].dtype})
+
         else:
             if ds[var].dtype.kind == "f":
                 encoding[var] = _enc_f32(16)
@@ -330,10 +349,10 @@ def write_forecast_region_chunked(
             if start_idx > 0:
                 ds = ds.isel(prediction_timedelta=slice(1, None))
                 pred_slice = slice(
-                    1 + start_idx, 1 + start_idx + group_forecast.shape[1]
+                    1 + start_idx, 1 + start_idx + group_forecast.shape[2]
                 )
             else:
-                pred_slice = slice(0, 1 + group_forecast.shape[1])
+                pred_slice = slice(0, 1 + group_forecast.shape[2])
 
             start = int(group_positions[0])
             stop = int(group_positions[-1]) + 1

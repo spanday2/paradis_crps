@@ -25,7 +25,6 @@ from typing import Union, Type, Tuple
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from model.padding import GeoCyclicPadding
 
@@ -132,6 +131,45 @@ class ChannelNorm(nn.Module):
         x = torch.einsum("...cij,...ij,c->...cij", shifted_x, inv_std, self.weight)
         x = x + self.bias[..., :, None, None]
         return x
+    
+class ConditionalChannelNorm(nn.Module):
+    """Channel normalization conditioned on a spatial noise embedding."""
+
+    def __init__(self, input_dim: int, noise_dim: int):
+        super().__init__()
+
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be > 0, got {input_dim}")
+        if noise_dim <= 0:
+            raise ValueError(f"noise_dim must be > 0, got {noise_dim}")
+
+        self.eps = 1e-5
+
+        self.weight = nn.Parameter(torch.ones(input_dim), requires_grad=True)
+        self.bias = nn.Parameter(torch.zeros(input_dim), requires_grad=True)
+
+        self.noise_scale = nn.Linear(noise_dim, input_dim)
+        self.noise_bias = nn.Linear(noise_dim, input_dim)
+
+        nn.init.zeros_(self.noise_scale.weight)
+        nn.init.ones_(self.noise_scale.bias)
+
+        nn.init.zeros_(self.noise_bias.weight)
+        nn.init.zeros_(self.noise_bias.bias)
+
+    def forward(self, x: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
+        cvar, cmean = torch.var_mean(x, dim=-3, keepdim=False)
+        inv_std = (self.eps + cvar) ** -0.5
+        shifted_x = x - cmean[..., None, :, :]
+
+        x_norm = torch.einsum("...cij,...ij,c->...cij", shifted_x, inv_std, self.weight)
+        x_norm = x_norm + self.bias[..., :, None, None]
+
+        noise = noise_emb.permute(0, 2, 3, 1)
+        scale = self.noise_scale(noise).permute(0, 3, 1, 2)
+        bias = self.noise_bias(noise).permute(0, 3, 1, 2)
+
+        return x_norm * scale + bias
 
 
 # LowRankBias -- low-rank factorized bias operator
@@ -219,12 +257,13 @@ class GMBlock(nn.Sequential):
         input_dim: int,
         output_dim: int,
         mesh_size: Tuple[int, int],
-        kernel_size:Union[Sequence[int], int] = 5,
+        kernel_size: Union[Sequence[int], int] = 5,
         hidden_dim: Union[Sequence, int] = 0,
         activation_fn: Type[nn.Module] = nn.SiLU,
         bias_channels: int = 0,
         activation: Union[Sequence, bool] = False,
         pre_normalize: bool = False,
+        noise_dim: int = 0,
     ):
         num_layers = len(layers)
         if num_layers == 0:
@@ -247,24 +286,33 @@ class GMBlock(nn.Sequential):
         else:
             assert len(kernel_size) == num_layers
 
+        self.pre_normalize = pre_normalize
+        self.use_cond_norm = pre_normalize and noise_dim > 0
+
         blocks = []
 
         if pre_normalize:
-            blocks.append(
-                (
-                    "0-ChannelNorm",
-                    ChannelNorm(input_dim=input_dim, output_dim=input_dim),
+            if self.use_cond_norm:
+                blocks.append(
+                    (
+                        "0-ChannelNorm",
+                        ConditionalChannelNorm(input_dim=input_dim, noise_dim=noise_dim),
+                    )
                 )
-            )
+            else:
+                blocks.append(
+                    (
+                        "0-ChannelNorm",
+                        ChannelNorm(input_dim=input_dim, output_dim=input_dim),
+                    )
+                )
 
         layer_in_size = input_dim
 
         for idx, l in enumerate(layers):
             if isinstance(l, str):
                 if l not in BLOCK_REGISTRY:
-                    raise ValueError(
-                        f"Unknown layer type: {l}. Available: {list(BLOCK_REGISTRY.keys())}"
-                    )
+                    raise ValueError(f"Unknown layer type: {l}. Available: {list(BLOCK_REGISTRY.keys())}")
                 ltype = BLOCK_REGISTRY[l]
             else:
                 ltype = l
@@ -275,18 +323,20 @@ class GMBlock(nn.Sequential):
                 layer_out_size = hidden_dim[idx]
 
             layer_name = f"{idx}-{ltype.__name__}"
+
             layer_obj = ltype(
                 input_dim=layer_in_size,
                 output_dim=layer_out_size,
                 mesh_size=mesh_size,
                 kernel_size=kernel_size[idx],
             )
+
             blocks.append((layer_name, layer_obj))
 
             if idx == 0 and bias_channels > 0:
                 blocks.append(
                     (
-                        f"0-GlobalBias",
+                        "0-GlobalBias",
                         GlobalBias(
                             input_dim=bias_channels,
                             output_dim=layer_out_size,
@@ -302,3 +352,17 @@ class GMBlock(nn.Sequential):
 
         super().__init__(OrderedDict(blocks))
         init_module_convs(self, last_conv_scale=0.1)
+
+    def forward(self, x: torch.Tensor, noise_emb: torch.Tensor | None = None) -> torch.Tensor:
+        for name, module in self._modules.items():
+            if name == "0-ChannelNorm":
+                if self.use_cond_norm:
+                    if noise_emb is None:
+                        raise ValueError("GMBlock built with noise_dim > 0 requires noise_emb in forward()")
+                    x = module(x, noise_emb)
+                else:
+                    x = module(x)
+            else:
+                x = module(x)
+
+        return x

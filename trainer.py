@@ -3,12 +3,12 @@ import re
 import time
 from collections import defaultdict, OrderedDict
 
+import numpy as np
 import lightning as L
 from lightning.pytorch.utilities import rank_zero_only
 import omegaconf.dictconfig
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 from data.datamodule import Era5DataModule
 from model.paradis import Paradis
@@ -79,6 +79,21 @@ def _strip_orig_mod_prefix(state_dict: dict[str, torch.Tensor]) -> OrderedDict:
         fixed[new_k] = v
     return fixed
 
+def _extract_model_state_dict(state_dict: dict[str, torch.Tensor]) -> OrderedDict:
+    model_state_dict = OrderedDict()
+
+    for k, v in state_dict.items():
+        new_k = k.replace("._orig_mod.", ".")
+
+        if new_k.startswith("_orig_mod."):
+            new_k = new_k[len("_orig_mod."):]
+
+        if new_k.startswith("model."):
+            new_k = new_k[len("model."):]
+            model_state_dict[new_k] = v
+
+    return model_state_dict
+
 
 class LitParadis(L.LightningModule):
     """Lightning module for Paradis model training."""
@@ -104,7 +119,6 @@ class LitParadis(L.LightningModule):
         self.model = Paradis(datamodule, cfg, lat_grid, lon_grid)
         self.cfg = cfg
         self.n_inputs = cfg.dataset.n_time_inputs
-        self.gradient_checkpoint = cfg.compute.gradient_checkpointing
         
         # ------------------------------------------------------------------ #
         # Probabilistic ensemble configuration
@@ -213,8 +227,8 @@ class LitParadis(L.LightningModule):
             pairwise_coeff = cfg.training.get("crps_pairwise_coeff", None,)
 
             self.crps_loss = TwoMemberAlmostFairCRPS(
-                var_loss_weights=var_loss_weights_reordered, alpha=alpha,
-                pairwise_coeff=pairwise_coeff,
+                var_loss_weights=var_loss_weights_reordered, lat_grid=datamodule.lat, alpha=alpha,
+                pairwise_coeff=pairwise_coeff, apply_latitude_weights=cfg.training.loss_function.lat_weights,
             )
             
             spectral_cfg = cfg.training.get("spectral_crps", {},)
@@ -260,7 +274,7 @@ class LitParadis(L.LightningModule):
         self.print_losses = cfg.training.print_losses
 
         # Load weights only but reset lightning configuration
-        if (cfg.init.checkpoint_path and not cfg.init.restart): # or cfg.forecast.enable:
+        if cfg.init.checkpoint_path and not cfg.init.restart and not cfg.forecast.enable:
             # Load into CPU, then Lightning will transfer to GPU
             checkpoint = torch.load(
                 cfg.init.checkpoint_path, weights_only=False, map_location="cpu"
@@ -297,6 +311,12 @@ class LitParadis(L.LightningModule):
                         )
 
             self.load_state_dict(sd, strict=True)
+            
+        if cfg.forecast.enable and cfg.init.checkpoint_path:
+            checkpoint = torch.load(cfg.init.checkpoint_path, weights_only=False, map_location="cpu")
+            sd = _extract_model_state_dict(checkpoint["state_dict"])
+            self.model.load_state_dict(sd, strict=True)
+            logging.info(f"Loaded forecast model weights from {cfg.init.checkpoint_path}")
 
         # Compile model in place
         if cfg.compute.compile == True:
@@ -370,13 +390,6 @@ class LitParadis(L.LightningModule):
         return noise_emb
     
     def forward(self, x: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
-
-        if self.training and self.gradient_checkpoint:
-            def model_forward(x, noise_emb):
-                return self.model(x, noise_emb=noise_emb)
-
-            return checkpoint(model_forward, x, noise_emb, use_reentrant=False)
-
         return self.model(x, noise_emb=noise_emb)
 
     def configure_optimizers(self):  # type: ignore
@@ -855,40 +868,86 @@ class LitParadis(L.LightningModule):
         num_forecast_steps = self.cfg.model.forecast_steps
         output_frequency = self.cfg.forecast.output_frequency
         write_every_n = self.cfg.forecast.get("write_every_n", num_forecast_steps)
+        num_members = int(self.cfg.forecast.num_ensemble_members)
+
+        if num_members <= 0:
+            raise ValueError(f"forecast.num_ensemble_members must be > 0, got {num_members}")
 
         output_features = list(dataset.dyn_output_features)
 
         constants = constant_data[:, :1].permute(0, 1, 4, 2, 3)
 
+        batch_size = input_data.size(0)
+
+        # Each ensemble member must maintain its own autoregressive state.
+        member_inputs = [input_data.clone() for _ in range(num_members)]
+
         chunk_buffer = []
         chunk_start_idx = None
         stored_step_idx = 0
 
-        batch_size = input_data.size(0)
-
         for step in range(num_forecast_steps):
 
             forcings_step = forcings[:, step].unsqueeze(1).permute(0, 1, 4, 2, 3)
-            model_input = torch.cat([input_data, forcings_step, constants], dim=2).squeeze(1)
-            raw_noise = self._sample_raw_noise(batch_size=batch_size, device=model_input.device, dtype=model_input.dtype)
-            noise_emb = self._embed_raw_noise(raw_noise)
-            output_data = self(model_input, noise_emb=noise_emb)
-            input_data = self._autoregression_next_input(model_input, output_data).unsqueeze(1)
+
+            step_member_outputs = []
+
+            for member in range(num_members):
+
+                model_input = torch.cat([member_inputs[member], forcings_step, constants], dim=2).squeeze(1)
+
+                raw_noise = self._sample_raw_noise(batch_size=batch_size, device=model_input.device, dtype=model_input.dtype)
+                noise_emb = self._embed_raw_noise(raw_noise)
+
+                output_data = self(model_input, noise_emb=noise_emb)
+
+                member_inputs[member] = self._autoregression_next_input(model_input, output_data).unsqueeze(1).detach()
+
+                step_member_outputs.append(output_data.detach())
+
+                del raw_noise
+                del noise_emb
+                del output_data
+
+            # Shape:
+            #   [B, M, F, Lat, Lon]
+            step_output = torch.stack(step_member_outputs, dim=1)
 
             if step % output_frequency == 0:
 
                 if chunk_start_idx is None:
                     chunk_start_idx = stored_step_idx
 
-                chunk_buffer.append(output_data.detach())
+                chunk_buffer.append(step_output)
                 stored_step_idx += 1
 
                 if len(chunk_buffer) == write_every_n:
 
-                    chunk_tensor = torch.stack(chunk_buffer, dim=1).cpu()
-                    denormalize_datasets(None, chunk_tensor, dataset)
+                    # Shape:
+                    #   [B, M, T_chunk, F, Lat, Lon]
+                    chunk_tensor = torch.stack(chunk_buffer, dim=2).cpu()
+
+                    # denormalize_datasets expects:
+                    #   [B, T_chunk, F, Lat, Lon]
+                    # so process each ensemble member separately.
+                    for member in range(num_members):
+                        denormalize_datasets(None, chunk_tensor[:, member], dataset)
+
                     chunk_np = chunk_tensor.numpy()
-                    convert_cartesian_to_spherical_winds(dataset.lat, dataset.lon, self.cfg, chunk_np, output_features)
+
+                    # Wind conversion also expects one forecast trajectory at a time.
+                    for member in range(num_members):
+                        member_forecast = np.ascontiguousarray(chunk_np[:, member])
+
+                        convert_cartesian_to_spherical_winds(
+                            dataset.lat,
+                            dataset.lon,
+                            self.cfg,
+                            member_forecast,
+                            output_features,
+                        )
+
+                        chunk_np[:, member] = member_forecast
 
                     self.forecast_writer.write_forecast_chunk(
                         forecast=chunk_np,
@@ -903,16 +962,33 @@ class LitParadis(L.LightningModule):
                     chunk_buffer.clear()
                     chunk_start_idx = None
 
-            del raw_noise
-            del noise_emb
-            del output_data
+            del step_member_outputs
+            del step_output
 
+        # Write any remaining forecast outputs.
         if chunk_buffer:
 
-            chunk_tensor = torch.stack(chunk_buffer, dim=1).cpu()
-            denormalize_datasets(None, chunk_tensor, dataset)
+            # Shape:
+            #   [B, M, T_chunk, F, Lat, Lon]
+            chunk_tensor = torch.stack(chunk_buffer, dim=2).cpu()
+
+            for member in range(num_members):
+                denormalize_datasets(None, chunk_tensor[:, member], dataset)
+
             chunk_np = chunk_tensor.numpy()
-            convert_cartesian_to_spherical_winds(dataset.lat, dataset.lon, self.cfg, chunk_np, output_features)
+
+            for member in range(num_members):
+                member_forecast = np.ascontiguousarray(chunk_np[:, member])
+
+                convert_cartesian_to_spherical_winds(
+                    dataset.lat,
+                    dataset.lon,
+                    self.cfg,
+                    member_forecast,
+                    output_features,
+                )
+
+                chunk_np[:, member] = member_forecast
 
             self.forecast_writer.write_forecast_chunk(
                 forecast=chunk_np,
@@ -920,6 +996,9 @@ class LitParadis(L.LightningModule):
                 start_idx=chunk_start_idx,
                 dataset=dataset,
             )
+
+            del chunk_tensor
+            del chunk_np
 
         return None
 

@@ -14,7 +14,12 @@ from data.datamodule import Era5DataModule
 from model.paradis import Paradis
 from utils.loss import ParadisLoss
 from utils.normalization import denormalize_humidity, denormalize_precipitation
+from utils.postprocessing import denormalize_datasets, convert_cartesian_to_spherical_winds
 from utils.file_output import ZarrForecastWriter
+from utils.crps_loss import (
+    TwoMemberAlmostFairCRPS,
+    TwoMemberSpectralAlmostFairCRPS,
+)
 
 # Configure torch.compile to handle dynamic shapes in Muon/NorMuon optimizers
 torch._dynamo.config.cache_size_limit = 64
@@ -100,6 +105,28 @@ class LitParadis(L.LightningModule):
         self.cfg = cfg
         self.n_inputs = cfg.dataset.n_time_inputs
         self.gradient_checkpoint = cfg.compute.gradient_checkpointing
+        
+        # ------------------------------------------------------------------ #
+        # Probabilistic ensemble configuration
+        # ------------------------------------------------------------------ #
+
+        self.noise_channels = cfg.model.noise_channels
+        self.num_members = cfg.training.get("num_ensemble_members", 2)
+
+        self.nlat = lat_grid.shape[0]
+        self.nlon = lat_grid.shape[1]
+
+        if self.noise_channels <= 0:
+            raise ValueError(
+                f"Probabilistic Paradis requires noise_channels > 0, "
+                f"got noise_channels={self.noise_channels}."
+            )
+
+        if self.num_members != 2 and not cfg.forecast.enable:
+            raise ValueError(
+                "Two-member afCRPS training requires "
+                f"num_ensemble_members=2, got {self.num_members}."
+            )
 
         # Log metrics
         num_parameters = sum(
@@ -108,7 +135,12 @@ class LitParadis(L.LightningModule):
 
         if self.global_rank == 0:
             logging.info("Number of trainable parameters: {:,}".format(num_parameters))
-
+            logging.info(
+                f"Probabilistic ensemble training: "
+                f"{self.num_members} members, "
+                f"noise_channels={self.noise_channels}"
+            )
+            
         # Access output_name_order from configuration
         self.output_name_order = datamodule.output_name_order
 
@@ -172,45 +204,54 @@ class LitParadis(L.LightningModule):
 
         # Initialize loss function with delta schedule parameters
         if not cfg.forecast.enable:
+            # ------------------------------------------------------------------ #
+            # Probabilistic loss
+            # ------------------------------------------------------------------ #
+
+            alpha = cfg.training.get("crps_alpha", 0.95)
+
+            pairwise_coeff = cfg.training.get("crps_pairwise_coeff", None,)
+
+            self.crps_loss = TwoMemberAlmostFairCRPS(
+                var_loss_weights=var_loss_weights_reordered, alpha=alpha,
+                pairwise_coeff=pairwise_coeff,
+            )
+            
+            spectral_cfg = cfg.training.get("spectral_crps", {},)
+            self.spectral_crps_weight = float(spectral_cfg.get("weight", 0.0))
+
+            if self.spectral_crps_weight > 0.0:
+                self.spectral_crps_loss = (
+                    TwoMemberSpectralAlmostFairCRPS(
+                        nlat=self.nlat,
+                        nlon=self.nlon,
+                        var_loss_weights=var_loss_weights_reordered,
+                        alpha=alpha,
+                        pairwise_coeff=pairwise_coeff,
+                        grid=spectral_cfg.get(
+                            "grid",
+                            "equiangular",
+                        ),
+                    )
+                )
+            else:
+                self.spectral_crps_loss = None
+                
             self.loss_fn = ParadisLoss(
-                loss_function=cfg.training.loss_function.type,
+                loss_function="mse",
                 lat_grid=datamodule.lat,
                 pressure_levels=torch.tensor(
-                    cfg.features.pressure_levels, dtype=torch.float32
+                    cfg.features.pressure_levels,
+                    dtype=torch.float32,
                 ),
                 num_features=datamodule.num_out_features,
-                num_surface_vars=len(cfg.features.output.surface),
+                num_surface_vars=len(
+                    cfg.features.output.surface
+                ),
                 var_loss_weights=var_loss_weights_reordered,
                 output_name_order=datamodule.output_name_order,
                 delta_loss=cfg.training.loss_function.delta_loss,
                 apply_latitude_weights=cfg.training.loss_function.lat_weights,
-            )
-
-            # Possibly use a different loss for validation
-            validation_loss_type = cfg.training.loss_function.get(
-                "validation_loss", None
-            )
-            if validation_loss_type is not None:
-
-                self.val_loss_fn = ParadisLoss(
-                    loss_function=validation_loss_type,
-                    lat_grid=datamodule.lat,
-                    pressure_levels=torch.tensor(
-                        cfg.features.pressure_levels, dtype=torch.float32
-                    ),
-                    num_features=datamodule.num_out_features,
-                    num_surface_vars=len(cfg.features.output.surface),
-                    var_loss_weights=var_loss_weights_reordered,
-                    output_name_order=datamodule.output_name_order,
-                    delta_loss=cfg.training.loss_function.delta_loss,
-                    apply_latitude_weights=cfg.training.loss_function.lat_weights,
-                )
-
-            else:
-                self.val_loss_fn = self.loss_fn
-
-            self.detach_gradient_every = cfg.training.optimizer.get(
-                "detach_gradient_every", None
             )
 
             self.automatic_optimization = False
@@ -313,12 +354,30 @@ class LitParadis(L.LightningModule):
                 )
 
         return torch.sqrt(errors).detach()
+    
+    def _sample_raw_noise(self, batch_size: int, device: torch.device, dtype: torch.dtype, ) -> torch.Tensor:
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the model."""
-        if self.cfg.model.forecast_steps > 1:
-            return self._apply_checkpoint(self.model, x)
-        return self.model(x)
+        return torch.randn(batch_size, self.noise_channels, self.nlat, self.nlon, device=device, dtype=dtype,)
+
+    def _embed_raw_noise(self, raw_noise: torch.Tensor,) -> torch.Tensor:
+
+        B, C_n, lat, lon = raw_noise.shape
+        noise_flat = (raw_noise.permute(0, 2, 3, 1).reshape(B * lat * lon, C_n))
+        emb_flat = self.model.noise_embedding(noise_flat)
+        emb_dim = emb_flat.shape[-1]
+        noise_emb = (emb_flat.reshape(B, lat, lon, emb_dim).permute(0, 3, 1, 2))
+
+        return noise_emb
+    
+    def forward(self, x: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
+
+        if self.training and self.gradient_checkpoint:
+            def model_forward(x, noise_emb):
+                return self.model(x, noise_emb=noise_emb)
+
+            return checkpoint(model_forward, x, noise_emb, use_reentrant=False)
+
+        return self.model(x, noise_emb=noise_emb)
 
     def configure_optimizers(self):  # type: ignore
         """Configure optimizer and learning rate scheduler."""
@@ -489,211 +548,283 @@ class LitParadis(L.LightningModule):
         if self.print_losses:
             self.epoch_start_time = time.time()
 
-    def _apply_checkpoint(self, func, *args):
-        if self.gradient_checkpoint:
-            return checkpoint(func, *args, use_reentrant=False)
-        else:
-            return func(*args)
-
     def training_step(self, batch, batch_idx):
+
         input_data, true_data, forcings, constant_data = batch
-
         opt = self.optimizers()
-
         grad_accum_steps = self.cfg.training.get("accumulate_grad_batches", 1)
 
         if batch_idx % grad_accum_steps == 0:
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
 
         constants = constant_data[:, :1].permute(0, 1, 4, 2, 3)
         forcings = forcings.permute(0, 1, 4, 2, 3)
 
+        batch_size = input_data.size(0)
         num_steps = true_data.size(1)
 
-        train_loss_for_logging = 0.0
-        chunk_loss = 0.0
+        member1_input = input_data.clone()
+        member2_input = input_data.clone()
 
-        detach_every_n = self.detach_gradient_every
-        scheduler = self.lr_schedulers()
-
-        if self.log_statistics:
-            train_channel_loss_weighted = torch.zeros(
-                self.loss_fn.num_features,
-                device=self.device,
-                dtype=torch.float32
-            )
-
-            train_channel_loss_unweighted = torch.zeros(
-                self.loss_fn.num_features,
-                device=self.device,
-                dtype=torch.float32
-            )
+        log_spatial_loss = input_data.new_zeros(())
+        log_fit = input_data.new_zeros(())
+        log_spread = input_data.new_zeros(())
+        log_spectral_loss = input_data.new_zeros(())
+        log_total_loss = input_data.new_zeros(())
 
         for step in range(num_steps):
+
+            y = true_data[:, step]
+
             forcings_step = forcings[:, step].unsqueeze(1)
 
-            model_input = torch.cat(
-                [input_data, forcings_step, constants], dim=2
-            ).squeeze(1)
+            model_input1 = torch.cat([member1_input, forcings_step, constants], dim=2).squeeze(1)
+            model_input2 = torch.cat([member2_input, forcings_step, constants], dim=2).squeeze(1)
 
-            output_data = self(model_input)
+            raw_noise1 = self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype)
+            raw_noise2 = self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype)
 
-            loss = self.loss_fn(output_data, true_data[:, step])
+            # ---------------------------------------------------------- #
+            # Member 1: fit gradient
+            # ---------------------------------------------------------- #
 
-            if self.log_statistics:
-                with torch.no_grad():
-                    train_channel_loss_weighted += self.loss_fn.per_channel_loss(
-                        output_data,
-                        true_data[:, step],
-                        weighted=True,
-                    ).float()
+            noise1 = self._embed_raw_noise(raw_noise1)
+            x1 = self.forward(model_input1, noise_emb=noise1)
+            loss_x1_fit = self.crps_loss.fit_term(x1, y)
 
-                    train_channel_loss_unweighted += self.loss_fn.per_channel_loss(
-                        output_data,
-                        true_data[:, step],
-                        weighted=False,
-                    ).float()
+            if self.spectral_crps_loss is not None:
+                loss_x1_fit = loss_x1_fit + self.spectral_crps_weight * self.spectral_crps_loss.fit_term(x1, y)
 
-            train_loss_for_logging = train_loss_for_logging + loss.detach()
+            loss_x1_fit = loss_x1_fit / num_steps / grad_accum_steps
+            self.manual_backward(loss_x1_fit)
+            x1_det = x1.detach()
 
-            chunk_loss = chunk_loss + loss / (num_steps * grad_accum_steps)
+            del x1
+            del noise1
+            del loss_x1_fit
 
-            input_data = self._autoregression_next_input(
-                model_input, output_data,
-            ).unsqueeze(1)
+            # ---------------------------------------------------------- #
+            # Member 2: fit + spread gradient
+            # ---------------------------------------------------------- #
 
-            should_backward_chunk = (
-                detach_every_n is not None
-                and (step + 1) % detach_every_n == 0
-            )
+            noise2 = self._embed_raw_noise(raw_noise2)
+            x2 = self.forward(model_input2, noise_emb=noise2)
+            fit_x2 = self.crps_loss.fit_term(x2, y)
+            spread_x2 = self.crps_loss.spread_term(x1_det, x2)
+            loss_x2 = fit_x2 - spread_x2
 
-            is_last_step = step == num_steps - 1
+            if self.spectral_crps_loss is not None:
+                spec_fit_x2 = self.spectral_crps_loss.fit_term(x2, y)
+                spec_spread_x2 = self.spectral_crps_loss.spread_term(x1_det, x2)
+                loss_x2 = loss_x2 + self.spectral_crps_weight * (spec_fit_x2 - spec_spread_x2)
 
-            if should_backward_chunk or is_last_step:
-                self.manual_backward(chunk_loss)
-                input_data = input_data.detach()
-                chunk_loss = 0.0
+            loss_x2 = loss_x2 / num_steps / grad_accum_steps
+            self.manual_backward(loss_x2)
+            x2_det = x2.detach()
 
-        is_last_batch = self.trainer.is_last_batch
+            del x2
+            del noise2
+            del fit_x2
+            del spread_x2
+            del loss_x2
 
-        should_step_optimizer = (
-            (batch_idx + 1) % grad_accum_steps == 0
-            or is_last_batch
-        )
+            # ---------------------------------------------------------- #
+            # Recompute member 1: spread gradient
+            # ---------------------------------------------------------- #
+
+            noise1_re = self._embed_raw_noise(raw_noise1)
+            x1_re = self.forward(model_input1, noise_emb=noise1_re)
+            spread_x1 = self.crps_loss.spread_term(x1_re, x2_det)
+            loss_x1_spread = -spread_x1
+
+            if self.spectral_crps_loss is not None:
+                spec_spread_x1 = self.spectral_crps_loss.spread_term(x1_re, x2_det)
+                loss_x1_spread = loss_x1_spread - self.spectral_crps_weight * spec_spread_x1
+
+            loss_x1_spread = loss_x1_spread / num_steps / grad_accum_steps
+            self.manual_backward(loss_x1_spread)
+            x1_re_det = x1_re.detach()
+
+            del x1_re
+            del noise1_re
+            del spread_x1
+            del loss_x1_spread
+
+            # ---------------------------------------------------------- #
+            # Logging
+            # ---------------------------------------------------------- #
+
+            with torch.no_grad():
+                step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1_re_det, x2_det, y)
+                weighted_spectral_loss = input_data.new_zeros(())
+                step_total_loss = step_spatial_loss
+
+                if self.spectral_crps_loss is not None:
+                    spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(x1_re_det, x2_det, y)
+                    weighted_spectral_loss = self.spectral_crps_weight * spectral_loss
+                    step_total_loss = step_total_loss + weighted_spectral_loss
+
+                log_spatial_loss += step_spatial_loss
+                log_fit += step_fit
+                log_spread += step_spread
+                log_spectral_loss += weighted_spectral_loss
+                log_total_loss += step_total_loss
+
+            # ---------------------------------------------------------- #
+            # Independent autoregressive propagation
+            # ---------------------------------------------------------- #
+
+            member1_input = self._autoregression_next_input(model_input1, x1_re_det).unsqueeze(1)
+            member2_input = self._autoregression_next_input(model_input2, x2_det).unsqueeze(1)
+
+            member1_input = member1_input.detach()
+            member2_input = member2_input.detach()
+
+            del x1_det
+            del x1_re_det
+            del x2_det
+            del raw_noise1
+            del raw_noise2
+
+        should_step_optimizer = (batch_idx + 1) % grad_accum_steps == 0 or self.trainer.is_last_batch
 
         if should_step_optimizer:
             opt.step()
-            scheduler.step()
+            scheduler = self.lr_schedulers()
 
-        train_loss = train_loss_for_logging / num_steps
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    pass
+                else:
+                    scheduler.step()
 
-        if self.log_statistics:
-            train_channel_loss_weighted = train_channel_loss_weighted / num_steps
-            train_channel_loss_unweighted = train_channel_loss_unweighted / num_steps
+        batch_spatial_loss = log_spatial_loss / num_steps
+        batch_fit = log_fit / num_steps
+        batch_spread = log_spread / num_steps
+        batch_spectral_loss = log_spectral_loss / num_steps
+        batch_total_loss = log_total_loss / num_steps
 
-            channel_metrics = {}
+        self.log("train_spatial_afcrps_loss", batch_spatial_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_spatial_afcrps_fit", batch_fit, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_spatial_afcrps_spread", batch_spread, prog_bar=False, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_spectral_afcrps_loss", batch_spectral_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_total_afcrps_loss", batch_total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("lr", opt.param_groups[0]["lr"], prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
+        self.log("forecast_steps", num_steps, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
 
-            channel_metrics.update(
-                {
-                    f"train_loss_channel_weighted/{name}": train_channel_loss_weighted[i]
-                    for i, name in enumerate(self.output_name_order)
-                }
-            )
-
-            channel_metrics.update(
-                {
-                    f"train_loss_channel_unweighted/{name}": train_channel_loss_unweighted[i]
-                    for i, name in enumerate(self.output_name_order)
-                }
-            )
-
-            self.log_dict(
-                channel_metrics,
-                on_step=True,
-                on_epoch=False,
-                prog_bar=False,
-                sync_dist=True,
-            )
-
-        self.log(
-            "train_loss",
-            train_loss,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
-
-        self.log("lr", opt.param_groups[0]["lr"], prog_bar=True)
-
-        self.log(
-            "forecast_steps",
-            num_steps,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            sync_dist=True,
-        )
-
-        return train_loss
+        return batch_total_loss.detach()
+    
 
     def validation_step(self, batch, batch_idx):
-        """Validation step."""
 
         input_data, true_data, forcings, constant_data = batch
+
         constants = constant_data[:, :1].permute(0, 1, 4, 2, 3)
         forcings = forcings.permute(0, 1, 4, 2, 3)
 
-        val_loss = 0.0
-        report_loss = 0.0
+        batch_size = input_data.size(0)
         num_steps = true_data.size(1)
 
+        member1_input = input_data.clone()
+        member2_input = input_data.clone()
+
+        total_spatial_loss = input_data.new_zeros(())
+        total_fit = input_data.new_zeros(())
+        total_spread = input_data.new_zeros(())
+        total_spectral_loss = input_data.new_zeros(())
+        total_loss = input_data.new_zeros(())
+
+        if self.enable_reports:
+            report_loss = torch.zeros(len(self.report_ind), dtype=input_data.dtype, device=input_data.device)
+            
         for step in range(num_steps):
+
+            y = true_data[:, step]
+
             forcings_step = forcings[:, step].unsqueeze(1)
 
-            input_data = torch.cat(
-                [input_data, forcings_step, constants], dim=2
-            ).squeeze(1)
+            model_input1 = torch.cat([member1_input, forcings_step, constants], dim=2).squeeze(1)
+            model_input2 = torch.cat([member2_input, forcings_step, constants], dim=2).squeeze(1)
 
-            # Forward pass
-            output_data = self(input_data)
+            raw_noise1 = self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype)
+            raw_noise2 = self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype)
 
-            loss = self.val_loss_fn(output_data, true_data[:, step])
+            noise1 = self._embed_raw_noise(raw_noise1)
+            noise2 = self._embed_raw_noise(raw_noise2)
 
-            # Log requested scaled RMSE losses for validation
+            x1 = self.forward(model_input1, noise_emb=noise1)
+            x2 = self.forward(model_input2, noise_emb=noise2)
+
+            # ---------------------------------------------------------- #
+            # Spatial afCRPS
+            # ---------------------------------------------------------- #
+
+            step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1, x2, y)
+
+            step_total_loss = step_spatial_loss
+
+            # ---------------------------------------------------------- #
+            # Spectral afCRPS
+            # ---------------------------------------------------------- #
+
+            weighted_spectral_loss = input_data.new_zeros(())
+
+            if self.spectral_crps_loss is not None:
+                spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(x1, x2, y)
+                weighted_spectral_loss = self.spectral_crps_weight * spectral_loss
+                step_total_loss = step_total_loss + weighted_spectral_loss
+
+            total_spatial_loss += step_spatial_loss
+            total_fit += step_fit
+            total_spread += step_spread
+            total_spectral_loss += weighted_spectral_loss
+            total_loss += step_total_loss
+
+            # ---------------------------------------------------------- #
+            # Ensemble-mean RMSE reporting
+            # ---------------------------------------------------------- #
+
+            ensemble_mean = 0.5 * (x1 + x2)
+                
             if self.enable_reports:
-                report_loss += self._get_report_rmse(output_data, true_data[:, step])
+                report_loss += self._get_report_rmse(ensemble_mean, y)
 
-            # Compute loss (data is already transformed by dataset)
-            val_loss += loss
+            # ---------------------------------------------------------- #
+            # Independent autoregressive propagation
+            # ---------------------------------------------------------- #
 
-            input_data = self._autoregression_next_input(
-                input_data, output_data,
-            ).unsqueeze(1)
+            member1_input = self._autoregression_next_input(model_input1, x1).unsqueeze(1)
+            member2_input = self._autoregression_next_input(model_input2, x2).unsqueeze(1)
 
-        batch_loss = val_loss / num_steps
+            member1_input = member1_input.detach()
+            member2_input = member2_input.detach()
 
-        self.log(
-            "val_loss",
-            batch_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
+        batch_spatial_loss = total_spatial_loss / num_steps
+        batch_fit = total_fit / num_steps
+        batch_spread = total_spread / num_steps
+        batch_spectral_loss = total_spectral_loss / num_steps
+        batch_total_loss = total_loss / num_steps
 
-        # Log requested reports
-        for i, name in enumerate(self.cfg.training.reports.features):
-            self.log(
-                name,
-                report_loss[i] / num_steps,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-            )
+        # -------------------------------------------------------------- #
+        # Primary validation loss = CRPS objective
+        # -------------------------------------------------------------- #
 
-        return batch_loss
+        self.log("val_loss", batch_total_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        self.log("val_spatial_afcrps_loss", batch_spatial_loss, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_spatial_afcrps_fit", batch_fit, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_spatial_afcrps_spread", batch_spread, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_spectral_afcrps_loss", batch_spectral_loss, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("val_total_afcrps_loss", batch_total_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # -------------------------------------------------------------- #
+        # RMSE reports using ensemble mean
+        # -------------------------------------------------------------- #
+        if self.enable_reports:
+            for i, name in enumerate(self.cfg.training.reports.features):
+                self.log(name, report_loss[i] / num_steps, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        return batch_total_loss
 
     def _autoregression_next_input(
         self,
@@ -717,39 +848,35 @@ class LitParadis(L.LightningModule):
         )
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        sample_indices, input_data, forcings, constant_data = batch
 
+        sample_indices, input_data, forcings, constant_data = batch
         dataset = self.datamodule.dataset
 
         num_forecast_steps = self.cfg.model.forecast_steps
         output_frequency = self.cfg.forecast.output_frequency
         write_every_n = self.cfg.forecast.get("write_every_n", num_forecast_steps)
 
-        from utils.postprocessing import (
-            denormalize_datasets,
-            convert_cartesian_to_spherical_winds,
-        )
-
         output_features = list(dataset.dyn_output_features)
+
         constants = constant_data[:, :1].permute(0, 1, 4, 2, 3)
 
         chunk_buffer = []
         chunk_start_idx = None
         stored_step_idx = 0
 
+        batch_size = input_data.size(0)
+
         for step in range(num_forecast_steps):
+
             forcings_step = forcings[:, step].unsqueeze(1).permute(0, 1, 4, 2, 3)
-
-            model_input = torch.cat(
-                [input_data, forcings_step, constants], dim=2
-            ).squeeze(1)
-            output_data = self(model_input)
-
-            input_data = self._autoregression_next_input(
-                model_input, output_data
-            ).unsqueeze(1)
+            model_input = torch.cat([input_data, forcings_step, constants], dim=2).squeeze(1)
+            raw_noise = self._sample_raw_noise(batch_size=batch_size, device=model_input.device, dtype=model_input.dtype)
+            noise_emb = self._embed_raw_noise(raw_noise)
+            output_data = self(model_input, noise_emb=noise_emb)
+            input_data = self._autoregression_next_input(model_input, output_data).unsqueeze(1)
 
             if step % output_frequency == 0:
+
                 if chunk_start_idx is None:
                     chunk_start_idx = stored_step_idx
 
@@ -757,45 +884,39 @@ class LitParadis(L.LightningModule):
                 stored_step_idx += 1
 
                 if len(chunk_buffer) == write_every_n:
+
                     chunk_tensor = torch.stack(chunk_buffer, dim=1).cpu()
                     denormalize_datasets(None, chunk_tensor, dataset)
-
                     chunk_np = chunk_tensor.numpy()
-                    convert_cartesian_to_spherical_winds(
-                        dataset.lat, dataset.lon, self.cfg, chunk_np, output_features
-                    )
+                    convert_cartesian_to_spherical_winds(dataset.lat, dataset.lon, self.cfg, chunk_np, output_features)
 
                     self.forecast_writer.write_forecast_chunk(
                         forecast=chunk_np,
-                        sample_indices=(
-                            None
-                            if sample_indices is None
-                            else sample_indices.cpu().numpy()
-                        ),
+                        sample_indices=None if sample_indices is None else sample_indices.cpu().numpy(),
                         start_idx=chunk_start_idx,
                         dataset=dataset,
                     )
 
-                    del chunk_tensor, chunk_np
+                    del chunk_tensor
+                    del chunk_np
+
                     chunk_buffer.clear()
                     chunk_start_idx = None
 
+            del raw_noise
+            del noise_emb
             del output_data
 
         if chunk_buffer:
+
             chunk_tensor = torch.stack(chunk_buffer, dim=1).cpu()
             denormalize_datasets(None, chunk_tensor, dataset)
-
             chunk_np = chunk_tensor.numpy()
-            convert_cartesian_to_spherical_winds(
-                dataset.lat, dataset.lon, self.cfg, chunk_np, output_features
-            )
+            convert_cartesian_to_spherical_winds(dataset.lat, dataset.lon, self.cfg, chunk_np, output_features)
 
             self.forecast_writer.write_forecast_chunk(
                 forecast=chunk_np,
-                sample_indices=(
-                    None if sample_indices is None else sample_indices.cpu().numpy()
-                ),
+                sample_indices=None if sample_indices is None else sample_indices.cpu().numpy(),
                 start_idx=chunk_start_idx,
                 dataset=dataset,
             )
@@ -809,7 +930,7 @@ class LitParadis(L.LightningModule):
             current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
 
             # Get the losses using the logged metrics
-            train_loss = self.trainer.callback_metrics.get("train_loss")
+            train_loss = self.trainer.callback_metrics.get("train_total_afcrps_loss")
             val_loss = self.trainer.callback_metrics.get("val_loss")
 
             if (
@@ -819,8 +940,8 @@ class LitParadis(L.LightningModule):
             ):
                 print(
                     f"Epoch {self.current_epoch:4d} | "
-                    f"Train Loss: {train_loss.item():.6f} | "
-                    f"Val Loss: {val_loss.item():.6f} | "
+                    f"Train afCRPS: {train_loss.item():.6f} | "
+                    f"Val afCRPS: {val_loss.item():.6f} | "
                     f"LR: {current_lr:.2e} | "
                     f"Elapsed time: {elapsed_time:.4f}s"
                 )

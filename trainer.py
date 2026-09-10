@@ -126,6 +126,17 @@ class LitParadis(L.LightningModule):
 
         self.noise_channels = cfg.model.noise_channels
         self.num_members = cfg.training.get("num_ensemble_members", 2)
+        self.detach_gradient_every = cfg.training.get("detach_gradient_every", 1)
+        
+        if self.detach_gradient_every is not None:
+            self.detach_gradient_every = int(self.detach_gradient_every)
+
+            if self.detach_gradient_every < 1:
+                raise ValueError(
+                    "training.detach_gradient_every must be >= 1 or null, "
+                    f"got {self.detach_gradient_every}."
+                )
+                
 
         self.nlat = lat_grid.shape[0]
         self.nlon = lat_grid.shape[1]
@@ -576,132 +587,226 @@ class LitParadis(L.LightningModule):
         batch_size = input_data.size(0)
         num_steps = true_data.size(1)
 
+        # Initial autoregressive states
         member1_input = input_data.clone()
         member2_input = input_data.clone()
 
+        # Logging accumulators
         log_spatial_loss = input_data.new_zeros(())
         log_fit = input_data.new_zeros(())
         log_spread = input_data.new_zeros(())
         log_spectral_loss = input_data.new_zeros(())
         log_total_loss = input_data.new_zeros(())
 
-        for step in range(num_steps):
+        if self.detach_gradient_every is None:
+            segment_size = num_steps
+        else:
+            segment_size = self.detach_gradient_every
 
-            y = true_data[:, step]
+        for segment_start in range(0, num_steps, segment_size):
 
-            forcings_step = forcings[:, step].unsqueeze(1)
+            segment_end = min(segment_start + segment_size, num_steps)
+            n_segment_steps = segment_end - segment_start
 
-            model_input1 = torch.cat([member1_input, forcings_step, constants], dim=2).squeeze(1)
-            model_input2 = torch.cat([member2_input, forcings_step, constants], dim=2).squeeze(1)
+            member1_segment_start = member1_input
+            member2_segment_start = member2_input
 
-            raw_noise1 = self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype)
-            raw_noise2 = self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype)
+            raw_noise1_segment = []
+            raw_noise2_segment = []
 
-            # ---------------------------------------------------------- #
-            # Member 1: fit gradient
-            # ---------------------------------------------------------- #
+            for _ in range(n_segment_steps):
+                raw_noise1_segment.append(self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype))
+                raw_noise2_segment.append(self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype))
 
-            noise1 = self._embed_raw_noise(raw_noise1)
-            x1 = self.forward(model_input1, noise_emb=noise1)
-            loss_x1_fit = self.crps_loss.fit_term(x1, y)
+            m1 = member1_segment_start
+            member1_fit_loss = None
+            member1_detached_outputs = []
 
-            if self.spectral_crps_loss is not None:
-                loss_x1_fit = loss_x1_fit + self.spectral_crps_weight * self.spectral_crps_loss.fit_term(x1, y)
+            for local_step, step in enumerate(range(segment_start, segment_end)):
 
-            loss_x1_fit = loss_x1_fit / num_steps / grad_accum_steps
-            self.manual_backward(loss_x1_fit)
-            x1_det = x1.detach()
+                y = true_data[:, step]
+                forcings_step = forcings[:, step].unsqueeze(1)
 
-            del x1
-            del noise1
-            del loss_x1_fit
+                model_input1 = torch.cat([m1, forcings_step, constants], dim=2).squeeze(1)
 
-            # ---------------------------------------------------------- #
-            # Member 2: fit + spread gradient
-            # ---------------------------------------------------------- #
+                noise1 = self._embed_raw_noise(raw_noise1_segment[local_step])
+                x1 = self.forward(model_input1, noise_emb=noise1)
 
-            noise2 = self._embed_raw_noise(raw_noise2)
-            x2 = self.forward(model_input2, noise_emb=noise2)
-            fit_x2 = self.crps_loss.fit_term(x2, y)
-            spread_x2 = self.crps_loss.spread_term(x1_det, x2)
-            loss_x2 = fit_x2 - spread_x2
+                # Spatial fit
+                step_member1_fit = self.crps_loss.fit_term(x1, y)
 
-            if self.spectral_crps_loss is not None:
-                spec_fit_x2 = self.spectral_crps_loss.fit_term(x2, y)
-                spec_spread_x2 = self.spectral_crps_loss.spread_term(x1_det, x2)
-                loss_x2 = loss_x2 + self.spectral_crps_weight * (spec_fit_x2 - spec_spread_x2)
-
-            loss_x2 = loss_x2 / num_steps / grad_accum_steps
-            self.manual_backward(loss_x2)
-            x2_det = x2.detach()
-
-            del x2
-            del noise2
-            del fit_x2
-            del spread_x2
-            del loss_x2
-
-            # ---------------------------------------------------------- #
-            # Recompute member 1: spread gradient
-            # ---------------------------------------------------------- #
-
-            noise1_re = self._embed_raw_noise(raw_noise1)
-            x1_re = self.forward(model_input1, noise_emb=noise1_re)
-            spread_x1 = self.crps_loss.spread_term(x1_re, x2_det)
-            loss_x1_spread = -spread_x1
-
-            if self.spectral_crps_loss is not None:
-                spec_spread_x1 = self.spectral_crps_loss.spread_term(x1_re, x2_det)
-                loss_x1_spread = loss_x1_spread - self.spectral_crps_weight * spec_spread_x1
-
-            loss_x1_spread = loss_x1_spread / num_steps / grad_accum_steps
-            self.manual_backward(loss_x1_spread)
-            x1_re_det = x1_re.detach()
-
-            del x1_re
-            del noise1_re
-            del spread_x1
-            del loss_x1_spread
-
-            # ---------------------------------------------------------- #
-            # Logging
-            # ---------------------------------------------------------- #
-
-            with torch.no_grad():
-                step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1_re_det, x2_det, y)
-                weighted_spectral_loss = input_data.new_zeros(())
-                step_total_loss = step_spatial_loss
-
+                # Spectral fit
                 if self.spectral_crps_loss is not None:
-                    spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(x1_re_det, x2_det, y)
-                    weighted_spectral_loss = self.spectral_crps_weight * spectral_loss
-                    step_total_loss = step_total_loss + weighted_spectral_loss
+                    spec_fit_x1 = self.spectral_crps_loss.fit_term(x1, y)
+                    step_member1_fit = step_member1_fit + self.spectral_crps_weight * spec_fit_x1
 
-                log_spatial_loss += step_spatial_loss
-                log_fit += step_fit
-                log_spread += step_spread
-                log_spectral_loss += weighted_spectral_loss
-                log_total_loss += step_total_loss
+                # normalization
+                step_member1_fit = step_member1_fit / num_steps / grad_accum_steps
 
-            # ---------------------------------------------------------- #
-            # Independent autoregressive propagation
-            # ---------------------------------------------------------- #
+                if member1_fit_loss is None:
+                    member1_fit_loss = step_member1_fit
+                else:
+                    member1_fit_loss = member1_fit_loss + step_member1_fit
 
-            member1_input = self._autoregression_next_input(model_input1, x1_re_det).unsqueeze(1)
-            member2_input = self._autoregression_next_input(model_input2, x2_det).unsqueeze(1)
+                member1_detached_outputs.append(x1.detach())
 
-            member1_input = member1_input.detach()
-            member2_input = member2_input.detach()
+                m1 = self._autoregression_next_input(model_input1, x1).unsqueeze(1)
 
-            del x1_det
-            del x1_re_det
-            del x2_det
-            del raw_noise1
-            del raw_noise2
+                del noise1
+                del step_member1_fit
+
+            # ======================================================
+            # Backward 1: Member-1 fit
+            # ======================================================
+
+            self.manual_backward(member1_fit_loss)
+
+            del member1_fit_loss
+            del m1
+            del x1
+            del model_input1
+
+            m2 = member2_segment_start
+            member2_loss = None
+            member2_detached_outputs = []
+
+            for local_step, step in enumerate(range(segment_start, segment_end)):
+
+                y = true_data[:, step]
+                forcings_step = forcings[:, step].unsqueeze(1)
+
+                model_input2 = torch.cat([m2, forcings_step, constants], dim=2).squeeze(1)
+
+                noise2 = self._embed_raw_noise(raw_noise2_segment[local_step])
+                x2 = self.forward(model_input2, noise_emb=noise2)
+
+                # Member-2 spatial fit
+                fit_x2 = self.crps_loss.fit_term(x2, y)
+
+                spread_x2 = self.crps_loss.spread_term(member1_detached_outputs[local_step], x2)
+                step_member2_loss = fit_x2 - spread_x2
+
+                # Spectral CRPS
+                if self.spectral_crps_loss is not None:
+                    spec_fit_x2 = self.spectral_crps_loss.fit_term(x2, y)
+                    spec_spread_x2 = self.spectral_crps_loss.spread_term(member1_detached_outputs[local_step], x2)
+                    step_member2_loss = step_member2_loss + self.spectral_crps_weight * (spec_fit_x2 - spec_spread_x2)
+
+                # Normalization
+                step_member2_loss = step_member2_loss / num_steps / grad_accum_steps
+
+                if member2_loss is None:
+                    member2_loss = step_member2_loss
+                else:
+                    member2_loss = member2_loss + step_member2_loss
+
+                member2_detached_outputs.append(x2.detach())
+
+                m2 = self._autoregression_next_input(model_input2, x2).unsqueeze(1)
+
+                del noise2
+                del fit_x2
+                del spread_x2
+                del step_member2_loss
+
+            # ======================================================
+            # Backward 2: Member-2 fit + Member-2 spread gradient
+            # ======================================================
+
+            self.manual_backward(member2_loss)
+
+            del member2_loss
+
+            member2_input = m2.detach()
+
+            del m2
+            del x2
+            del model_input2
+
+            m1_re = member1_segment_start
+            member1_spread_loss = None
+
+            for local_step, step in enumerate(range(segment_start, segment_end)):
+
+                y = true_data[:, step]
+                forcings_step = forcings[:, step].unsqueeze(1)
+
+                model_input1_re = torch.cat([m1_re, forcings_step, constants], dim=2).squeeze(1)
+
+                noise1_re = self._embed_raw_noise(raw_noise1_segment[local_step])
+                x1_re = self.forward(model_input1_re, noise_emb=noise1_re)
+
+                spread_x1 = self.crps_loss.spread_term(x1_re, member2_detached_outputs[local_step])
+                step_member1_spread_loss = -spread_x1
+
+                # Spectral spread gradient
+                if self.spectral_crps_loss is not None:
+                    spec_spread_x1 = self.spectral_crps_loss.spread_term(x1_re, member2_detached_outputs[local_step])
+                    step_member1_spread_loss = step_member1_spread_loss - self.spectral_crps_weight * spec_spread_x1
+
+                #normalization
+                step_member1_spread_loss = step_member1_spread_loss / num_steps / grad_accum_steps
+
+                if member1_spread_loss is None:
+                    member1_spread_loss = step_member1_spread_loss
+                else:
+                    member1_spread_loss = member1_spread_loss + step_member1_spread_loss
+
+                # Logging
+
+                with torch.no_grad():
+
+                    x1_log = x1_re.detach()
+                    x2_log = member2_detached_outputs[local_step]
+
+                    step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1_log, x2_log, y)
+
+                    weighted_spectral_loss = input_data.new_zeros(())
+                    step_total_loss = step_spatial_loss
+
+                    if self.spectral_crps_loss is not None:
+                        spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(x1_log, x2_log, y)
+                        weighted_spectral_loss = self.spectral_crps_weight * spectral_loss
+                        step_total_loss = step_total_loss + weighted_spectral_loss
+
+                    log_spatial_loss += step_spatial_loss
+                    log_fit += step_fit
+                    log_spread += step_spread
+                    log_spectral_loss += weighted_spectral_loss
+                    log_total_loss += step_total_loss
+
+                m1_re = self._autoregression_next_input(model_input1_re, x1_re).unsqueeze(1)
+
+                del noise1_re
+                del spread_x1
+                del step_member1_spread_loss
+
+            self.manual_backward(member1_spread_loss)
+
+            del member1_spread_loss
+
+            member1_input = m1_re.detach()
+
+            del m1_re
+            del x1_re
+            del model_input1_re
+
+            # Segment cleanup
+            del member1_detached_outputs
+            del member2_detached_outputs
+            del raw_noise1_segment
+            del raw_noise2_segment
+            del member1_segment_start
+            del member2_segment_start
+
+        # ==========================================================
+        # Optimizer step
+        # ==========================================================
 
         should_step_optimizer = (batch_idx + 1) % grad_accum_steps == 0 or self.trainer.is_last_batch
 
         if should_step_optimizer:
+
             opt.step()
             scheduler = self.lr_schedulers()
 
@@ -710,6 +815,10 @@ class LitParadis(L.LightningModule):
                     pass
                 else:
                     scheduler.step()
+
+        # ==========================================================
+        # Batch logging
+        # ==========================================================
 
         batch_spatial_loss = log_spatial_loss / num_steps
         batch_fit = log_fit / num_steps
@@ -727,7 +836,7 @@ class LitParadis(L.LightningModule):
 
         return batch_total_loss.detach()
     
-
+    
     def validation_step(self, batch, batch_idx):
 
         input_data, true_data, forcings, constant_data = batch

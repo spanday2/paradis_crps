@@ -1,14 +1,14 @@
 # Model architecture
 model:
   latent_size: 1024                # Set a fixed size of the latent space (if latent_multiplier is -1)
-  forecast_steps: 1                # Number of autoregressive steps
+  forecast_steps: 12               # Number of autoregressive steps
   base_dt: 21600                   # Data time resolution in seconds (6 hours * 3600 seconds)
   num_layers: 8                    # Model depth
   bias_channels: 8                 # Number of bias channels
   velocity_vectors: 768            # Number of velocity layers (if latent_multiplier is -1)
   adv_interpolation: bicubic       # Choose between bilinear or bicubic
   activation: SiLU                 # [SiLU, GELU]
-  coarsening_factor: 1             # Coarsens the processor grid by this factor
+  coarsening_factor: 2             # Coarsens the processor grid by this factor
   val_forecast_steps: ${model.forecast_steps}
 
   # Probabilistic ensemble
@@ -62,7 +62,7 @@ init:
 
 # Input dataset
 dataset:
-  root_dir: /path/to/dataset/
+  root_dir: /home/cap003/site7/datasets/era5_0.25deg_13level_lq
   time_resolution: 6h              # Dataset original resolution
   n_time_inputs: 2                 # Number inputs (For example, n_time_inputs: 2 feeds [tn-1, tn])
   sampling_interval: 6h            # Sample dataset feeds at this time interval
@@ -78,10 +78,10 @@ compute:
   accelerator: gpu                 # CPU/GPU
   use_amp: true                    # Enable AMP (Automatic Mixed Precision)
   batch_size: 1                    # Number of samples per batch
-  num_workers: 8                   # Number of parallel processes for data preloading
+  num_workers: 1                   # Number of parallel processes for data preloading
   val_num_workers: ${compute.num_workers} # Specify for different number of validation dataloader workers
   compile: true                    # Whether to compile the model [true | false | modules (compile layers only)]
-  gradient_checkpointing: false    # Enable activation checkpointing
+  gradient_checkpointing: true    # Enable activation checkpointing
 
 # Forecast parameters
 forecast:
@@ -96,7 +96,7 @@ forecast:
 # Training parameters
 training:
   max_epochs: -1                   # Maximum number of epochs the training is allowed (-1 to disable and use steps)
-  max_steps: 300000                # Maximum number of steps to use for training (-1 to disable and use epochs)
+  max_steps: 25                # Maximum number of steps to use for training (-1 to disable and use epochs)
   progress_bar: true               # Enable progress bar
   gradient_clip_val: null          # Gradient clipping value, set to null to disable
   print_losses: false              # Manually print losses to screen (removes progress bar)
@@ -105,6 +105,7 @@ training:
   experiment_name: null            # Optional: Custom name for log directory (replaces version_xxx), set to null for default versioning
   log_additional_stats: false      # Prints gradient-related metrics for debugging
   accumulate_grad_batches: 1       # Increase effective global batch size by this factor
+  detach_gradient_every: 2
 
   # Probabilistic ensemble training
   num_ensemble_members: 2          # Two-member ensemble used for afCRPS training
@@ -171,7 +172,7 @@ training:
     # 3. LambdaLR with initial warmup, steady learning rate and final cooldown
     wsd:
       enabled: true
-      warmup: 1000                 # ≥1 : number of warmup steps, else fraction
+      warmup: 10                 # ≥1 : number of warmup steps, else fraction
       decay: 0.2                   # ≥1 : number of decay steps, else fraction
 
   variable_loss_weights:

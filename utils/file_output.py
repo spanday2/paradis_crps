@@ -356,8 +356,19 @@ def write_forecast_region_chunked(
 
             start = int(group_positions[0])
             stop = int(group_positions[-1]) + 1
+            
+            # Coordinate variables were already written when the template
+            # Zarr store was created. Region writes should contain only
+            # variables varying over time/prediction_timedelta.
+            drop_vars = [
+                name
+                for name in ["member", "level", "latitude", "longitude"]
+                if name in ds.variables
+            ]
 
-            ds.to_zarr(
+            ds_write = ds.drop_vars(drop_vars)
+
+            ds_write.to_zarr(
                 filename,
                 region={
                     "time": slice(start, stop),

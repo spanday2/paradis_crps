@@ -1,7 +1,7 @@
 # Model architecture
 model:
   latent_size: 1024                # Set a fixed size of the latent space (if latent_multiplier is -1)
-  forecast_steps: 12               # Number of autoregressive steps
+  forecast_steps: 1               # Number of autoregressive steps
   base_dt: 21600                   # Data time resolution in seconds (6 hours * 3600 seconds)
   num_layers: 8                    # Model depth
   bias_channels: 8                 # Number of bias channels
@@ -58,11 +58,11 @@ model:
 init:
   seed: 42                         # If not provided, a seed will not be used
   checkpoint_path: null            # Path to model checkpoint for loading pre-trained weights
-  restart: false                   # Whether to restart from checkpoint (true) or only load pre-trained weights (false)
+  restart: true                   # Whether to restart from checkpoint (true) or only load pre-trained weights (false)
 
 # Input dataset
 dataset:
-  root_dir: /home/cap003/site7/datasets/era5_0.25deg_13level_lq
+  root_dir: /home/cap003/site8/datasets/paradis_pp_era5_13level_2deg_6h.zarr                       #/home/cap003/site7/datasets/era5_0.25deg_13level_lq
   time_resolution: 6h              # Dataset original resolution
   n_time_inputs: 2                 # Number inputs (For example, n_time_inputs: 2 feeds [tn-1, tn])
   sampling_interval: 6h            # Sample dataset feeds at this time interval
@@ -78,29 +78,29 @@ compute:
   accelerator: gpu                 # CPU/GPU
   use_amp: true                    # Enable AMP (Automatic Mixed Precision)
   batch_size: 1                    # Number of samples per batch
-  num_workers: 1                   # Number of parallel processes for data preloading
-  val_num_workers: ${compute.num_workers} # Specify for different number of validation dataloader workers
+  num_workers: 8                   # Number of parallel processes for data preloading
+  val_num_workers: 8               # Specify for different number of validation dataloader workers
   compile: true                    # Whether to compile the model [true | false | modules (compile layers only)]
   gradient_checkpointing: true    # Enable activation checkpointing
 
 # Forecast parameters
 forecast:
   enable: false                    # Set model to forecast mode
-  start_date: 2019-12-31           # Time to generate forecast from (YYYY-MM-DD) or (YYYY-MM-DDTHH:MM:SS)
-  end_date: null                   # OPTIONAL, for validation purposes (YYYY-MM-DD) or null
+  start_date: 2022-01-01           # Time to generate forecast from (YYYY-MM-DD) or (YYYY-MM-DDTHH:MM:SS)
+  end_date: 2022-01-31                   # OPTIONAL, for validation purposes (YYYY-MM-DD) or null
   output_frequency: 1              # Store to file every output_frequency forecast steps
   output_file: null                # Name of output forecast file
   write_every_n: 1                 # Write forecast every n steps
-  num_ensemble_members: 20
+  num_ensemble_members: 8
 
 # Training parameters
 training:
   max_epochs: -1                   # Maximum number of epochs the training is allowed (-1 to disable and use steps)
-  max_steps: 25                # Maximum number of steps to use for training (-1 to disable and use epochs)
+  max_steps: 300000                # Maximum number of steps to use for training (-1 to disable and use epochs)
   progress_bar: true               # Enable progress bar
   gradient_clip_val: null          # Gradient clipping value, set to null to disable
   print_losses: false              # Manually print losses to screen (removes progress bar)
-  log_every_n_steps: 100           # Write to log every n steps
+  log_every_n_steps: 500           # Write to log every n steps
   log_dir: logs                    # Where logs will be written
   experiment_name: null            # Optional: Custom name for log directory (replaces version_xxx), set to null for default versioning
   log_additional_stats: false      # Prints gradient-related metrics for debugging
@@ -172,7 +172,7 @@ training:
     # 3. LambdaLR with initial warmup, steady learning rate and final cooldown
     wsd:
       enabled: true
-      warmup: 10                 # ≥1 : number of warmup steps, else fraction
+      warmup: 1000                 # ≥1 : number of warmup steps, else fraction
       decay: 0.2                   # ≥1 : number of decay steps, else fraction
 
   variable_loss_weights:
@@ -190,7 +190,7 @@ training:
       wind_z_10m: 1.0
       2m_temperature: 1.0
       mean_sea_level_pressure: 1.0
-      total_precipitation_6hr: 1.0
+      total_precipitation: 1.0
   reports:
     enable: true
     features:
@@ -257,5 +257,5 @@ features:
     - wind_z_10m
     - 2m_temperature
     - mean_sea_level_pressure
-    - total_precipitation_6hr
+    - total_precipitation
 

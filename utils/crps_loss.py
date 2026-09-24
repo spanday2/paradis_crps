@@ -96,7 +96,7 @@ class TwoMemberAlmostFairCRPS(nn.Module):
         return 0.5 * self._weighted_mean_abs(x, y)
 
     def spread_term(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self.c * self._weighted_mean_abs(x1, x2)
+        return 0.5 * self.c * self._weighted_mean_abs(x1, x2)   # <---------CHANGE HERE
 
     def full_loss_for_logging(
         self, x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor

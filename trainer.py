@@ -1036,15 +1036,45 @@ class LitParadis(L.LightningModule):
                     #   [B, M, T_chunk, F, Lat, Lon]
                     chunk_tensor = torch.stack(chunk_buffer, dim=2).cpu()
 
-                    # denormalize_datasets expects:
-                    #   [B, T_chunk, F, Lat, Lon]
-                    # so process each ensemble member separately.
+                    # ----------------------------------------------------------
+                    # DEBUG 1: model output BEFORE denormalization
+                    # ----------------------------------------------------------
+                    if batch_idx == 0:
+                        print("\n" + "=" * 80)
+                        print("DEBUG: NORMALIZED FORECAST BEFORE DENORMALIZATION")
+                        print("=" * 80)
+                        print("chunk_start_idx =", chunk_start_idx)
+                        print("shape =", tuple(chunk_tensor.shape))
+                        print("min   =", float(chunk_tensor.min()))
+                        print("max   =", float(chunk_tensor.max()))
+                        print("mean  =", float(chunk_tensor.mean()))
+                        print("std   =", float(chunk_tensor.std()))
+                        print("finite =", bool(torch.isfinite(chunk_tensor).all()))
+
+                    # ----------------------------------------------------------
+                    # Denormalization
+                    # ----------------------------------------------------------
                     for member in range(num_members):
                         denormalize_datasets(None, chunk_tensor[:, member], dataset)
 
+                    # ----------------------------------------------------------
+                    # DEBUG 2: AFTER denormalization
+                    # ----------------------------------------------------------
+                    if batch_idx == 0:
+                        print("\n" + "=" * 80)
+                        print("DEBUG: FORECAST AFTER DENORMALIZATION")
+                        print("=" * 80)
+                        print("min   =", float(chunk_tensor.min()))
+                        print("max   =", float(chunk_tensor.max()))
+                        print("mean  =", float(chunk_tensor.mean()))
+                        print("std   =", float(chunk_tensor.std()))
+                        print("finite =", bool(torch.isfinite(chunk_tensor).all()))
+
                     chunk_np = chunk_tensor.numpy()
 
-                    # Wind conversion also expects one forecast trajectory at a time.
+                    # ----------------------------------------------------------
+                    # Wind conversion
+                    # ----------------------------------------------------------
                     for member in range(num_members):
                         member_forecast = np.ascontiguousarray(chunk_np[:, member])
 
@@ -1057,6 +1087,22 @@ class LitParadis(L.LightningModule):
                         )
 
                         chunk_np[:, member] = member_forecast
+
+                    # ----------------------------------------------------------
+                    # DEBUG 3: EXACT ARRAY ABOUT TO BE WRITTEN TO ZARR
+                    # ----------------------------------------------------------
+                    if batch_idx == 0:
+                        print("\n" + "=" * 80)
+                        print("DEBUG: FORECAST IMMEDIATELY BEFORE ZARR WRITE")
+                        print("=" * 80)
+                        print("chunk_start_idx =", chunk_start_idx)
+                        print("shape =", chunk_np.shape)
+                        print("min   =", np.nanmin(chunk_np))
+                        print("max   =", np.nanmax(chunk_np))
+                        print("mean  =", np.nanmean(chunk_np))
+                        print("std   =", np.nanstd(chunk_np))
+                        print("NaNs  =", np.isnan(chunk_np).sum())
+                        print("Infs  =", np.isinf(chunk_np).sum())
 
                     self.forecast_writer.write_forecast_chunk(
                         forecast=chunk_np,

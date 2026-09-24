@@ -84,6 +84,20 @@ class ERA5Dataset(torch.utils.data.Dataset):
         ds_stats = xarray.open_dataset(
             os.path.join(self.root_dir, "stats"), engine="zarr"
         )
+        
+        # Fix stats feature-name mismatch without modifying the dataset on disk
+        if (
+            "total_precipitation" in ds.features.values
+            and "total_precipitation_6hr" in ds_stats.features.values
+        ):
+            ds_stats = ds_stats.assign_coords(
+                features=[
+                    "total_precipitation"
+                    if f == "total_precipitation_6hr"
+                    else f
+                    for f in ds_stats.features.values
+                ]
+            )
 
         # Store them in main dataset for easier processing
         ds["mean"] = ds_stats["mean"]

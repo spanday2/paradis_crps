@@ -36,7 +36,7 @@ nvidia-smi
 
 python -u forecast.py \
     --config config/paradis_settings.yaml \
-    --checkpoint-path /home/shp000/site7/ensemble/paradis_crps_new2/paradis_crps/logs/lightning_logs/version_0/checkpoints/'epoch=0025.ckpt' \
+    --checkpoint-path /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_1/checkpoints/'epoch=0025.ckpt' \
     --output-file results/forecast_coeff0p1.zarr \
     --num-devices 4 \
     --forecast-steps 40 \

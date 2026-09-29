@@ -57,7 +57,7 @@ model:
 # Initialization settings (seeding)
 init:
   seed: 42                         # If not provided, a seed will not be used
-  checkpoint_path: null            # Path to model checkpoint for loading pre-trained weights
+  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_2/checkpoints/last.ckpt            # Path to model checkpoint for loading pre-trained weights
   restart: true                   # Whether to restart from checkpoint (true) or only load pre-trained weights (false)
 
 # Input dataset
@@ -92,6 +92,7 @@ forecast:
   output_file: null                # Name of output forecast file
   write_every_n: 1                 # Write forecast every n steps
   num_ensemble_members: 8
+  noise_first_step_only: true      # false: inject fresh random noise at every forecast step True:  inject random noise only at the first forecast step
 
 # Training parameters
 training:

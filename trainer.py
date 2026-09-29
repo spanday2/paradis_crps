@@ -1004,8 +1004,17 @@ class LitParadis(L.LightningModule):
             for member in range(num_members):
 
                 model_input = torch.cat([member_inputs[member], forcings_step, constants], dim=2).squeeze(1)
+                
+                # ----------------------------------------------------------
+                # Noise injection
+                # ----------------------------------------------------------
+                noise_first_step_only = self.cfg.forecast.get("noise_first_step_only", False,)
 
-                raw_noise = self._sample_raw_noise(batch_size=batch_size, device=model_input.device, dtype=model_input.dtype)
+                if noise_first_step_only and step > 0:
+                    raw_noise = torch.zeros(batch_size, self.noise_channels, self.nlat, self.nlon, device=model_input.device, dtype=model_input.dtype,)
+                else:
+                    raw_noise = self._sample_raw_noise(batch_size=batch_size, device=model_input.device, dtype=model_input.dtype,)
+
                 noise_emb = self._embed_raw_noise(raw_noise)
 
                 output_data = self(model_input, noise_emb=noise_emb)
@@ -1037,38 +1046,10 @@ class LitParadis(L.LightningModule):
                     chunk_tensor = torch.stack(chunk_buffer, dim=2).cpu()
 
                     # ----------------------------------------------------------
-                    # DEBUG 1: model output BEFORE denormalization
-                    # ----------------------------------------------------------
-                    if batch_idx == 0:
-                        print("\n" + "=" * 80)
-                        print("DEBUG: NORMALIZED FORECAST BEFORE DENORMALIZATION")
-                        print("=" * 80)
-                        print("chunk_start_idx =", chunk_start_idx)
-                        print("shape =", tuple(chunk_tensor.shape))
-                        print("min   =", float(chunk_tensor.min()))
-                        print("max   =", float(chunk_tensor.max()))
-                        print("mean  =", float(chunk_tensor.mean()))
-                        print("std   =", float(chunk_tensor.std()))
-                        print("finite =", bool(torch.isfinite(chunk_tensor).all()))
-
-                    # ----------------------------------------------------------
                     # Denormalization
                     # ----------------------------------------------------------
                     for member in range(num_members):
                         denormalize_datasets(None, chunk_tensor[:, member], dataset)
-
-                    # ----------------------------------------------------------
-                    # DEBUG 2: AFTER denormalization
-                    # ----------------------------------------------------------
-                    if batch_idx == 0:
-                        print("\n" + "=" * 80)
-                        print("DEBUG: FORECAST AFTER DENORMALIZATION")
-                        print("=" * 80)
-                        print("min   =", float(chunk_tensor.min()))
-                        print("max   =", float(chunk_tensor.max()))
-                        print("mean  =", float(chunk_tensor.mean()))
-                        print("std   =", float(chunk_tensor.std()))
-                        print("finite =", bool(torch.isfinite(chunk_tensor).all()))
 
                     chunk_np = chunk_tensor.numpy()
 
@@ -1087,22 +1068,6 @@ class LitParadis(L.LightningModule):
                         )
 
                         chunk_np[:, member] = member_forecast
-
-                    # ----------------------------------------------------------
-                    # DEBUG 3: EXACT ARRAY ABOUT TO BE WRITTEN TO ZARR
-                    # ----------------------------------------------------------
-                    if batch_idx == 0:
-                        print("\n" + "=" * 80)
-                        print("DEBUG: FORECAST IMMEDIATELY BEFORE ZARR WRITE")
-                        print("=" * 80)
-                        print("chunk_start_idx =", chunk_start_idx)
-                        print("shape =", chunk_np.shape)
-                        print("min   =", np.nanmin(chunk_np))
-                        print("max   =", np.nanmax(chunk_np))
-                        print("mean  =", np.nanmean(chunk_np))
-                        print("std   =", np.nanstd(chunk_np))
-                        print("NaNs  =", np.isnan(chunk_np).sum())
-                        print("Infs  =", np.isinf(chunk_np).sum())
 
                     self.forecast_writer.write_forecast_chunk(
                         forecast=chunk_np,

@@ -618,53 +618,29 @@ class LitParadis(L.LightningModule):
                 raw_noise1_segment.append(self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype))
                 raw_noise2_segment.append(self._sample_raw_noise(batch_size=batch_size, device=input_data.device, dtype=input_data.dtype))
 
-            m1 = member1_segment_start
-            member1_fit_loss = None
             member1_detached_outputs = []
+            m1_ref = member1_segment_start
 
-            for local_step, step in enumerate(range(segment_start, segment_end)):
+            with torch.no_grad():
+                for local_step, step in enumerate(range(segment_start, segment_end)):
+                    forcings_step = forcings[:, step].unsqueeze(1)
+                    model_input1_ref = torch.cat(
+                        [m1_ref, forcings_step, constants], dim=2
+                    ).squeeze(1)
 
-                y = true_data[:, step]
-                forcings_step = forcings[:, step].unsqueeze(1)
+                    noise1_ref = self._embed_raw_noise(raw_noise1_segment[local_step])
+                    x1_ref = self.forward(model_input1_ref, noise_emb=noise1_ref)
+                    member1_detached_outputs.append(x1_ref.detach())
 
-                model_input1 = torch.cat([m1, forcings_step, constants], dim=2).squeeze(1)
+                    m1_ref = self._autoregression_next_input(
+                        model_input1_ref, x1_ref
+                    ).unsqueeze(1)
 
-                noise1 = self._embed_raw_noise(raw_noise1_segment[local_step])
-                x1 = self.forward(model_input1, noise_emb=noise1)
+                    del noise1_ref
+                    del x1_ref
+                    del model_input1_ref
 
-                # Spatial fit
-                step_member1_fit = self.crps_loss.fit_term(x1, y)
-
-                # Spectral fit
-                if self.spectral_crps_loss is not None:
-                    spec_fit_x1 = self.spectral_crps_loss.fit_term(x1, y)
-                    step_member1_fit = step_member1_fit + self.spectral_crps_weight * spec_fit_x1
-
-                # normalization
-                step_member1_fit = step_member1_fit / num_steps / grad_accum_steps
-
-                if member1_fit_loss is None:
-                    member1_fit_loss = step_member1_fit
-                else:
-                    member1_fit_loss = member1_fit_loss + step_member1_fit
-
-                member1_detached_outputs.append(x1.detach())
-
-                m1 = self._autoregression_next_input(model_input1, x1).unsqueeze(1)
-
-                del noise1
-                del step_member1_fit
-
-            # ======================================================
-            # Backward 1: Member-1 fit
-            # ======================================================
-
-            self.manual_backward(member1_fit_loss)
-
-            del member1_fit_loss
-            del m1
-            del x1
-            del model_input1
+            del m1_ref
 
             m2 = member2_segment_start
             member2_loss = None
@@ -724,7 +700,7 @@ class LitParadis(L.LightningModule):
             del model_input2
 
             m1_re = member1_segment_start
-            member1_spread_loss = None
+            member1_loss = None
 
             for local_step, step in enumerate(range(segment_start, segment_end)):
 
@@ -736,21 +712,22 @@ class LitParadis(L.LightningModule):
                 noise1_re = self._embed_raw_noise(raw_noise1_segment[local_step])
                 x1_re = self.forward(model_input1_re, noise_emb=noise1_re)
 
+                fit_x1 = self.crps_loss.fit_term(x1_re, y)
                 spread_x1 = self.crps_loss.spread_term(x1_re, member2_detached_outputs[local_step])
-                step_member1_spread_loss = -spread_x1
+                step_member1_loss = fit_x1 - spread_x1
 
-                # Spectral spread gradient
+                # Spectral fit and spread gradient
                 if self.spectral_crps_loss is not None:
+                    spec_fit_x1 = self.spectral_crps_loss.fit_term(x1_re, y)
                     spec_spread_x1 = self.spectral_crps_loss.spread_term(x1_re, member2_detached_outputs[local_step])
-                    step_member1_spread_loss = step_member1_spread_loss - self.spectral_crps_weight * spec_spread_x1
+                    step_member1_loss = step_member1_loss + self.spectral_crps_weight * (spec_fit_x1 - spec_spread_x1)
 
-                #normalization
-                step_member1_spread_loss = step_member1_spread_loss / num_steps / grad_accum_steps
+                step_member1_loss = step_member1_loss / num_steps / grad_accum_steps
 
-                if member1_spread_loss is None:
-                    member1_spread_loss = step_member1_spread_loss
+                if member1_loss is None:
+                    member1_loss = step_member1_loss
                 else:
-                    member1_spread_loss = member1_spread_loss + step_member1_spread_loss
+                    member1_loss = member1_loss + step_member1_loss
 
                 # Logging
 
@@ -778,12 +755,13 @@ class LitParadis(L.LightningModule):
                 m1_re = self._autoregression_next_input(model_input1_re, x1_re).unsqueeze(1)
 
                 del noise1_re
+                del fit_x1
                 del spread_x1
-                del step_member1_spread_loss
+                del step_member1_loss
 
-            self.manual_backward(member1_spread_loss)
+            self.manual_backward(member1_loss)
 
-            del member1_spread_loss
+            del member1_loss
 
             member1_input = m1_re.detach()
 

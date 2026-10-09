@@ -1,7 +1,7 @@
 # Model architecture
 model:
   latent_size: 1024                # Set a fixed size of the latent space (if latent_multiplier is -1)
-  forecast_steps: 1               # Number of autoregressive steps
+  forecast_steps: 12               # Number of autoregressive steps
   base_dt: 21600                   # Data time resolution in seconds (6 hours * 3600 seconds)
   num_layers: 8                    # Model depth
   bias_channels: 8                 # Number of bias channels
@@ -57,8 +57,8 @@ model:
 # Initialization settings (seeding)
 init:
   seed: 42                         # If not provided, a seed will not be used
-  checkpoint_path: /home/shp000/site7/ensemble/paradis_crps/logs/lightning_logs/version_3/checkpoints/last.ckpt            # Path to model checkpoint for loading pre-trained weights
-  restart: true                   # Whether to restart from checkpoint (true) or only load pre-trained weights (false)
+  checkpoint_path: null            # Path to model checkpoint for loading pre-trained weights
+  restart: false                   # Whether to restart from checkpoint (true) or only load pre-trained weights (false)
 
 # Input dataset
 dataset:
@@ -92,12 +92,12 @@ forecast:
   output_file: null                # Name of output forecast file
   write_every_n: 1                 # Write forecast every n steps
   num_ensemble_members: 8
-  noise_first_step_only: false      # false: inject fresh random noise at every forecast step True:  inject random noise only at the first forecast step
+  noise_first_step_only: false     # false: inject fresh random noise at every forecast step True:  inject random noise only at the first forecast step
 
 # Training parameters
 training:
   max_epochs: -1                   # Maximum number of epochs the training is allowed (-1 to disable and use steps)
-  max_steps: 300000                # Maximum number of steps to use for training (-1 to disable and use epochs)
+  max_steps: 1000                # Maximum number of steps to use for training (-1 to disable and use epochs)
   progress_bar: true               # Enable progress bar
   gradient_clip_val: null          # Gradient clipping value, set to null to disable
   print_losses: false              # Manually print losses to screen (removes progress bar)
@@ -106,7 +106,7 @@ training:
   experiment_name: null            # Optional: Custom name for log directory (replaces version_xxx), set to null for default versioning
   log_additional_stats: false      # Prints gradient-related metrics for debugging
   accumulate_grad_batches: 1       # Increase effective global batch size by this factor
-  detach_gradient_every: 2
+  detach_gradient_every: null
 
   # Probabilistic ensemble training
   num_ensemble_members: 2          # Two-member ensemble used for afCRPS training
@@ -133,7 +133,7 @@ training:
 
   optimizer:
     name: adamw                  # Choose among [adamw, muon, normuon]
-    lr: 1e-4                       # Learning rate (LR) for the optimizer
+    lr: 1e-6                       # Learning rate (LR) for the optimizer
     weight_decay: 1.e-2            # Weight decay coefficient for regularization
     beta1: 0.9                     # Exponential decay rate for the first moment (gradient) estimates
     beta2: 0.95                    # Exponential decay rate for the second moment (squared gradient) estimates
@@ -173,7 +173,7 @@ training:
     # 3. LambdaLR with initial warmup, steady learning rate and final cooldown
     wsd:
       enabled: true
-      warmup: 1000                 # ≥1 : number of warmup steps, else fraction
+      warmup: 100                 # ≥1 : number of warmup steps, else fraction
       decay: 0.2                   # ≥1 : number of decay steps, else fraction
 
   variable_loss_weights:

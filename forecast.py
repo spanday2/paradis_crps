@@ -148,6 +148,10 @@ def main():
         logger=False,
         enable_checkpointing=False,
     )
+    
+    seed = cfg.init.get("seed", None)
+    if seed is not None:
+        L.seed_everything(int(seed), workers=True)
 
     trainer.predict(
         model,

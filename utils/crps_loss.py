@@ -76,7 +76,7 @@ class TwoMemberAlmostFairCRPS(nn.Module):
         weights = weights / weights.mean()
         return weights.to(dtype=grid_lat_deg.dtype)
 
-    def _weighted_mean_abs(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    def _weighted_mean_abs(self, a: torch.Tensor, b: torch.Tensor, lat_slice=None) -> torch.Tensor:
         """Computes the weighted mean absolute difference across B, C, Lat, Lon."""
         # Shape: [B, C, Lat, Lon]
         abs_diff = torch.abs(a - b)
@@ -87,22 +87,25 @@ class TwoMemberAlmostFairCRPS(nn.Module):
 
         # Apply latitude weights: broadcast to [1, 1, Lat, 1]
         if self.apply_latitude_weights and self.lat_weights is not None:
-            lat_weights = self.lat_weights.view(1, 1, -1, 1)
+            lat_weights = self.lat_weights
+            if lat_slice is not None:
+                lat_weights = lat_weights[lat_slice[0]:lat_slice[1]]
+            lat_weights = lat_weights.view(1, 1, -1, 1)
             abs_diff = abs_diff * lat_weights
 
         return torch.mean(abs_diff)
 
-    def fit_term(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self._weighted_mean_abs(x, y)
+    def fit_term(self, x: torch.Tensor, y: torch.Tensor, lat_slice=None) -> torch.Tensor:
+        return 0.5 * self._weighted_mean_abs(x, y, lat_slice=lat_slice)
 
-    def spread_term(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        return 0.5 * self.c * self._weighted_mean_abs(x1, x2)   # <---------CHANGE HERE
+    def spread_term(self, x1: torch.Tensor, x2: torch.Tensor, lat_slice=None) -> torch.Tensor:
+        return 0.5 * self.c * self._weighted_mean_abs(x1, x2, lat_slice=lat_slice)   # <---------CHANGE HERE
 
     def full_loss_for_logging(
-        self, x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor
+        self, x1: torch.Tensor, x2: torch.Tensor, y: torch.Tensor, lat_slice=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        fit = self.fit_term(x1, y) + self.fit_term(x2, y)
-        spread = self.spread_term(x1, x2)
+        fit = self.fit_term(x1, y, lat_slice=lat_slice) + self.fit_term(x2, y, lat_slice=lat_slice)
+        spread = self.spread_term(x1, x2, lat_slice=lat_slice)
         loss = fit - spread
         return loss, fit, spread
 

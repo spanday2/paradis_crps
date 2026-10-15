@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from model.advection import NeuralSemiLagrangian
 from model.blocks import GMBlock, PhysicalDownsample, SepConv
 from model.padding import GeoCyclicPadding
+from utils.spatial_parallel import SpatialParallelContext
 
 
 def get_scaled_timestep(original_timestep_seconds: float) -> float:
@@ -58,6 +59,7 @@ class Paradis(nn.Module):
         self.nlon = lat_grid.shape[1]
 
         mesh_size = (self.nlat, self.nlon)
+        self.spatial = SpatialParallelContext(cfg)
 
         hidden_dim = cfg.model.get("latent_size")
         
@@ -108,6 +110,7 @@ class Paradis(nn.Module):
         if stride < 1:
             raise ValueError("Coarsening factor must be >=1")
 
+        self.stride = stride
         self.nlat_coarse = (self.nlat - 1) // stride + 1
         self.nlon_coarse = self.nlon // stride
         mesh_size_coarse = (self.nlat_coarse, self.nlon_coarse)
@@ -122,6 +125,7 @@ class Paradis(nn.Module):
             activation_fn=self.activation_function,
             pre_normalize=False,
             bias_channels=0,
+            spatial_context=self.spatial,
         )
 
         self.velocity_nets = nn.ModuleList(
@@ -136,6 +140,7 @@ class Paradis(nn.Module):
                     activation_fn=self.activation_function,
                     pre_normalize=True,
                     noise_dim=self.noise_dim,
+                    spatial_context=self.spatial,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -151,6 +156,7 @@ class Paradis(nn.Module):
                     lat_grid=lat_grid[::stride, ::stride],
                     lon_grid=lon_grid[::stride, ::stride],
                     interpolation=adv_interpolation,
+                    spatial_context=self.spatial,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -168,6 +174,7 @@ class Paradis(nn.Module):
                     activation_fn=self.activation_function,
                     bias_channels=bias_channels,
                     noise_dim=self.noise_dim,
+                    spatial_context=self.spatial,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -185,6 +192,7 @@ class Paradis(nn.Module):
                     activation_fn=self.activation_function,
                     bias_channels=bias_channels,
                     noise_dim=self.noise_dim,
+                    spatial_context=self.spatial,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -201,21 +209,26 @@ class Paradis(nn.Module):
             activation_fn=self.activation_function,
             bias_channels=bias_channels,
             noise_dim=0,
+            spatial_context=self.spatial,
         )
 
         self.alpha_adv = nn.Parameter(torch.full((self.num_layers, hidden_dim), -1.0))
 
-        self.downsample = PhysicalDownsample(stride=stride)
+        self.downsample = PhysicalDownsample(
+            stride=stride, spatial_context=self.spatial,
+            global_input_height=self.nlat,
+            global_output_height=self.nlat_coarse,
+        )
 
         self.n_static = n_static = len(cfg.features.input.constants)
 
         self.static_encoder = nn.Sequential(
-            SepConv(n_static, 64, mesh_size, kernel_size=7),
+            SepConv(n_static, 64, mesh_size, kernel_size=7, spatial_context=self.spatial),
             nn.SiLU(),
-            GeoCyclicPadding(3),
+            GeoCyclicPadding(3, spatial_context=self.spatial, global_height=self.nlat),
             nn.Conv2d(64, 64, groups=64, kernel_size=7),
             nn.SiLU(),
-            SepConv(64, static_dim, mesh_size, kernel_size=5),
+            SepConv(64, static_dim, mesh_size, kernel_size=5, spatial_context=self.spatial),
         )
 
     def _compile(self):
@@ -225,6 +238,9 @@ class Paradis(nn.Module):
         self.output_proj = torch.compile(self.output_proj)
 
     def upsample(self, x: torch.Tensor) -> torch.Tensor:
+        if self.spatial.enabled:
+            x = self.spatial.gather_latitude(x, self.nlat_coarse)
+
         # Make longitude explicitly periodic before interpolation
         x_ext = torch.cat([x, x[..., :1]], dim=-1)
 
@@ -236,7 +252,10 @@ class Paradis(nn.Module):
             align_corners=True,
         )
 
-        return y_ext[..., :-1]
+        y = y_ext[..., :-1]
+        if self.spatial.enabled:
+            y = self.spatial.slice_latitude(y, self.nlat, dim=-2)
+        return y
 
     def _apply_checkpoint(self, func, *args):
         if self.training and self.gradient_checkpoint:
@@ -250,11 +269,11 @@ class Paradis(nn.Module):
 
     def _layer_step(self, i: int, hidden: torch.Tensor, hidden_static: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
         """Single physics-informed latent update."""
-        B = hidden.shape[0]
+        B, _, H_local, W_local = hidden.shape
 
         # Predict latent velocities (u, v) for advection
         velocities_raw = self.velocity_nets[i](hidden, noise_emb)
-        velocities = velocities_raw.view(B, 2, self.num_vels, self.nlat_coarse, self.nlon_coarse)
+        velocities = velocities_raw.view(B, 2, self.num_vels, H_local, W_local)
         u, v = velocities[:, 0], velocities[:, 1]
 
         g_adv = torch.sigmoid(self.alpha_adv[i]).to(hidden.dtype).view(1, -1, 1, 1)
@@ -275,6 +294,9 @@ class Paradis(nn.Module):
         return hidden
 
     def forward(self, fields: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
+        if self.spatial.enabled:
+            fields = self.spatial.slice_latitude(fields, self.nlat, dim=-2)
+            noise_emb = self.spatial.slice_latitude(noise_emb, self.nlat, dim=-2)
         hidden = self._apply_checkpoint(self.input_proj, fields)
         hidden_static = self._apply_checkpoint(
             self.static_encoder, fields[:, -self.n_static:])

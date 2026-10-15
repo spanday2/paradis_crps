@@ -117,6 +117,7 @@ class LitParadis(L.LightningModule):
         lat_grid = datamodule.dataset.lat_rad_grid
         lon_grid = datamodule.dataset.lon_rad_grid
         self.model = Paradis(datamodule, cfg, lat_grid, lon_grid)
+        self.spatial = self.model.spatial
         self.cfg = cfg
         self.n_inputs = cfg.dataset.n_time_inputs
         
@@ -330,7 +331,10 @@ class LitParadis(L.LightningModule):
             logging.info(f"Loaded forecast model weights from {cfg.init.checkpoint_path}")
 
         # Compile model in place
-        if cfg.compute.compile == True:
+        if self.spatial.enabled and cfg.compute.compile:
+            if self.global_rank == 0:
+                logging.warning("Spatial parallel enabled: torch.compile disabled for distributed halo exchanges")
+        elif cfg.compute.compile == True:
             self.model.compile(
                 mode="default",
                 fullgraph=True,
@@ -388,7 +392,22 @@ class LitParadis(L.LightningModule):
     
     def _sample_raw_noise(self, batch_size: int, device: torch.device, dtype: torch.dtype, ) -> torch.Tensor:
 
-        return torch.randn(batch_size, self.noise_channels, self.nlat, self.nlon, device=device, dtype=dtype,)
+        local_nlat = self.spatial.local_height(self.nlat)
+        # Each spatial rank must generate an independent latitude-band noise field.
+        # Lightning often seeds every DDP rank identically, so a rank-specific
+        # generator avoids repeating the same Gaussian pattern in each band.
+        if not self.spatial.enabled:
+            return torch.randn(batch_size, self.noise_channels, local_nlat, self.nlon, device=device, dtype=dtype)
+        generator = getattr(self, "_spatial_noise_generator", None)
+        if generator is None or generator.device != device:
+            generator = torch.Generator(device=device)
+            base_seed = self.cfg.init.get("seed", None)
+            if base_seed is None:
+                base_seed = torch.initial_seed()
+            seed = (int(base_seed) + 1000003 * self.spatial.info.global_rank) % (2**63 - 1)
+            generator.manual_seed(seed)
+            self._spatial_noise_generator = generator
+        return torch.randn(batch_size, self.noise_channels, local_nlat, self.nlon, device=device, dtype=dtype, generator=generator)
 
     def _embed_raw_noise(self, raw_noise: torch.Tensor,) -> torch.Tensor:
 
@@ -402,6 +421,18 @@ class LitParadis(L.LightningModule):
     
     def forward(self, x: torch.Tensor, noise_emb: torch.Tensor) -> torch.Tensor:
         return self.model(x, noise_emb=noise_emb)
+
+    def _spatial_lat_slice(self):
+        return self.spatial.lat_range(self.nlat) if self.spatial.enabled else None
+
+    def _spatial_loss_scale(self):
+        return self.spatial.loss_scale(self.nlat)
+
+    def _slice_fine_latitude(self, x):
+        return self.spatial.slice_latitude(x, self.nlat, dim=-2)
+
+    def _gather_spectral(self, x):
+        return self.spatial.gather_latitude(x, self.nlat) if self.spatial.enabled else x
 
     def configure_optimizers(self):  # type: ignore
         """Configure optimizer and learning rate scheduler."""
@@ -583,6 +614,13 @@ class LitParadis(L.LightningModule):
 
         constants = constant_data[:, :1].permute(0, 1, 4, 2, 3)
         forcings = forcings.permute(0, 1, 4, 2, 3)
+        if self.spatial.enabled:
+            input_data = self._slice_fine_latitude(input_data)
+            true_data = self._slice_fine_latitude(true_data)
+            forcings = self._slice_fine_latitude(forcings)
+            constants = self._slice_fine_latitude(constants)
+        lat_slice = self._spatial_lat_slice()
+        spatial_scale = self._spatial_loss_scale()
 
         batch_size = input_data.size(0)
         num_steps = true_data.size(1)
@@ -657,15 +695,15 @@ class LitParadis(L.LightningModule):
                 x2 = self.forward(model_input2, noise_emb=noise2)
 
                 # Member-2 spatial fit
-                fit_x2 = self.crps_loss.fit_term(x2, y)
+                fit_x2 = self.crps_loss.fit_term(x2, y, lat_slice=lat_slice) * spatial_scale
 
-                spread_x2 = self.crps_loss.spread_term(member1_detached_outputs[local_step], x2)
+                spread_x2 = self.crps_loss.spread_term(member1_detached_outputs[local_step], x2, lat_slice=lat_slice) * spatial_scale
                 step_member2_loss = fit_x2 - spread_x2
 
                 # Spectral CRPS
                 if self.spectral_crps_loss is not None:
-                    spec_fit_x2 = self.spectral_crps_loss.fit_term(x2, y)
-                    spec_spread_x2 = self.spectral_crps_loss.spread_term(member1_detached_outputs[local_step], x2)
+                    spec_fit_x2 = self.spectral_crps_loss.fit_term(self._gather_spectral(x2), self._gather_spectral(y))
+                    spec_spread_x2 = self.spectral_crps_loss.spread_term(self._gather_spectral(member1_detached_outputs[local_step]), self._gather_spectral(x2))
                     step_member2_loss = step_member2_loss + self.spectral_crps_weight * (spec_fit_x2 - spec_spread_x2)
 
                 # Normalization
@@ -712,14 +750,14 @@ class LitParadis(L.LightningModule):
                 noise1_re = self._embed_raw_noise(raw_noise1_segment[local_step])
                 x1_re = self.forward(model_input1_re, noise_emb=noise1_re)
 
-                fit_x1 = self.crps_loss.fit_term(x1_re, y)
-                spread_x1 = self.crps_loss.spread_term(x1_re, member2_detached_outputs[local_step])
+                fit_x1 = self.crps_loss.fit_term(x1_re, y, lat_slice=lat_slice) * spatial_scale
+                spread_x1 = self.crps_loss.spread_term(x1_re, member2_detached_outputs[local_step], lat_slice=lat_slice) * spatial_scale
                 step_member1_loss = fit_x1 - spread_x1
 
                 # Spectral fit and spread gradient
                 if self.spectral_crps_loss is not None:
-                    spec_fit_x1 = self.spectral_crps_loss.fit_term(x1_re, y)
-                    spec_spread_x1 = self.spectral_crps_loss.spread_term(x1_re, member2_detached_outputs[local_step])
+                    spec_fit_x1 = self.spectral_crps_loss.fit_term(self._gather_spectral(x1_re), self._gather_spectral(y))
+                    spec_spread_x1 = self.spectral_crps_loss.spread_term(self._gather_spectral(x1_re), self._gather_spectral(member2_detached_outputs[local_step]))
                     step_member1_loss = step_member1_loss + self.spectral_crps_weight * (spec_fit_x1 - spec_spread_x1)
 
                 step_member1_loss = step_member1_loss / num_steps / grad_accum_steps
@@ -736,13 +774,16 @@ class LitParadis(L.LightningModule):
                     x1_log = x1_re.detach()
                     x2_log = member2_detached_outputs[local_step]
 
-                    step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1_log, x2_log, y)
+                    step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1_log, x2_log, y, lat_slice=lat_slice)
 
+                    step_spatial_loss = step_spatial_loss * spatial_scale
+                    step_fit = step_fit * spatial_scale
+                    step_spread = step_spread * spatial_scale
                     weighted_spectral_loss = input_data.new_zeros(())
                     step_total_loss = step_spatial_loss
 
                     if self.spectral_crps_loss is not None:
-                        spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(x1_log, x2_log, y)
+                        spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(self._gather_spectral(x1_log), self._gather_spectral(x2_log), self._gather_spectral(y))
                         weighted_spectral_loss = self.spectral_crps_weight * spectral_loss
                         step_total_loss = step_total_loss + weighted_spectral_loss
 
@@ -821,6 +862,13 @@ class LitParadis(L.LightningModule):
 
         constants = constant_data[:, :1].permute(0, 1, 4, 2, 3)
         forcings = forcings.permute(0, 1, 4, 2, 3)
+        if self.spatial.enabled:
+            input_data = self._slice_fine_latitude(input_data)
+            true_data = self._slice_fine_latitude(true_data)
+            forcings = self._slice_fine_latitude(forcings)
+            constants = self._slice_fine_latitude(constants)
+        lat_slice = self._spatial_lat_slice()
+        spatial_scale = self._spatial_loss_scale()
 
         batch_size = input_data.size(0)
         num_steps = true_data.size(1)
@@ -859,8 +907,11 @@ class LitParadis(L.LightningModule):
             # Spatial afCRPS
             # ---------------------------------------------------------- #
 
-            step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1, x2, y)
+            step_spatial_loss, step_fit, step_spread = self.crps_loss.full_loss_for_logging(x1, x2, y, lat_slice=lat_slice)
 
+            step_spatial_loss = step_spatial_loss * spatial_scale
+            step_fit = step_fit * spatial_scale
+            step_spread = step_spread * spatial_scale
             step_total_loss = step_spatial_loss
 
             # ---------------------------------------------------------- #
@@ -870,7 +921,7 @@ class LitParadis(L.LightningModule):
             weighted_spectral_loss = input_data.new_zeros(())
 
             if self.spectral_crps_loss is not None:
-                spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(x1, x2, y)
+                spectral_loss, _, _ = self.spectral_crps_loss.full_loss_for_logging(self._gather_spectral(x1), self._gather_spectral(x2), self._gather_spectral(y))
                 weighted_spectral_loss = self.spectral_crps_weight * spectral_loss
                 step_total_loss = step_total_loss + weighted_spectral_loss
 
@@ -887,7 +938,7 @@ class LitParadis(L.LightningModule):
             ensemble_mean = 0.5 * (x1 + x2)
                 
             if self.enable_reports:
-                report_loss += self._get_report_rmse(ensemble_mean, y)
+                report_loss += self._get_report_rmse(self._gather_spectral(ensemble_mean), self._gather_spectral(y))
 
             # ---------------------------------------------------------- #
             # Independent autoregressive propagation
@@ -966,6 +1017,10 @@ class LitParadis(L.LightningModule):
 
         batch_size = input_data.size(0)
 
+        if self.spatial.enabled:
+            input_data = self._slice_fine_latitude(input_data)
+            constants = self._slice_fine_latitude(constants)
+
         # Each ensemble member must maintain its own autoregressive state.
         member_inputs = [input_data.clone() for _ in range(num_members)]
 
@@ -976,6 +1031,8 @@ class LitParadis(L.LightningModule):
         for step in range(num_forecast_steps):
 
             forcings_step = forcings[:, step].unsqueeze(1).permute(0, 1, 4, 2, 3)
+            if self.spatial.enabled:
+                forcings_step = self._slice_fine_latitude(forcings_step)
 
             step_member_outputs = []
 
@@ -989,7 +1046,7 @@ class LitParadis(L.LightningModule):
                 noise_first_step_only = self.cfg.forecast.get("noise_first_step_only", False,)
 
                 if noise_first_step_only and step > 0:
-                    raw_noise = torch.zeros(batch_size, self.noise_channels, self.nlat, self.nlon, device=model_input.device, dtype=model_input.dtype,)
+                    raw_noise = torch.zeros(batch_size, self.noise_channels, model_input.shape[-2], self.nlon, device=model_input.device, dtype=model_input.dtype,)
                 else:
                     raw_noise = self._sample_raw_noise(batch_size=batch_size, device=model_input.device, dtype=model_input.dtype,)
 
@@ -1008,16 +1065,19 @@ class LitParadis(L.LightningModule):
             # Shape:
             #   [B, M, F, Lat, Lon]
             step_output = torch.stack(step_member_outputs, dim=1)
+            if self.spatial.enabled and step % output_frequency == 0:
+                step_output = self.spatial.gather_latitude(step_output, self.nlat)
 
             if step % output_frequency == 0:
 
-                if chunk_start_idx is None:
+                if self.spatial.is_group_leader and chunk_start_idx is None:
                     chunk_start_idx = stored_step_idx
 
-                chunk_buffer.append(step_output)
+                if self.spatial.is_group_leader:
+                    chunk_buffer.append(step_output)
                 stored_step_idx += 1
 
-                if len(chunk_buffer) == write_every_n:
+                if self.spatial.is_group_leader and len(chunk_buffer) == write_every_n:
 
                     # Shape:
                     #   [B, M, T_chunk, F, Lat, Lon]
@@ -1064,7 +1124,7 @@ class LitParadis(L.LightningModule):
             del step_output
 
         # Write any remaining forecast outputs.
-        if chunk_buffer:
+        if self.spatial.is_group_leader and chunk_buffer:
 
             # Shape:
             #   [B, M, T_chunk, F, Lat, Lon]

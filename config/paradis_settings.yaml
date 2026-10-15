@@ -81,7 +81,10 @@ compute:
   num_workers: 8                   # Number of parallel processes for data preloading
   val_num_workers: 8               # Specify for different number of validation dataloader workers
   compile: true                    # Whether to compile the model [true | false | modules (compile layers only)]
-  gradient_checkpointing: true     # Enable activation checkpointing
+  gradient_checkpointing: false    # Disable initially for spatial-parallel correctness checks
+  spatial_parallel:
+    enabled: false                  # Set true to enable distributed latitude bands
+    size: 1                        # e.g. 4 for four GPUs per spatial group
 
 # Forecast parameters
 forecast:

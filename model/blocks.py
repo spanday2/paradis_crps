@@ -27,6 +27,7 @@ import torch
 from torch import nn
 
 from model.padding import GeoCyclicPadding
+from torch.cuda import nvtx
 
 
 def init_conv2d_default(conv: nn.Conv2d, *, scale: float = 1.0) -> None:
@@ -54,20 +55,50 @@ def init_module_convs(m: nn.Module, *, last_conv_scale: float = 1.0) -> None:
 
 
 class PhysicalDownsample(nn.Module):
-    """Downsample a physical field.
+    """Downsample a physical field exactly as in the non-sharded model.
 
-    Uses average pooling for anti-aliasing, then interpolates to the exact target
-    size to handle 2N-1 latitude grids cleanly.
+    With spatial parallelism, the fine-grid latitude bands are gathered only for
+    this inexpensive pooling operation.  The resulting coarse field is then
+    re-sharded.  This avoids alignment errors between fine and coarse band
+    boundaries for 2N-1 latitude grids.
     """
 
-    def __init__(self, stride=4):
+    def __init__(
+        self,
+        stride=4,
+        spatial_context=None,
+        global_input_height=None,
+        global_output_height=None,
+    ):
         super().__init__()
         self.pool = nn.AvgPool2d(kernel_size=5, stride=stride, count_include_pad=False)
         self.padding = GeoCyclicPadding(2)
+        self.spatial_context = spatial_context
+        self.global_input_height = global_input_height
+        self.global_output_height = global_output_height
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.padding(x)
-        return self.pool(x)
+        if self.spatial_context is not None and self.spatial_context.enabled:
+            if self.global_input_height is None or self.global_output_height is None:
+                raise ValueError("Global fine/coarse heights are required for spatial downsampling")
+
+            with nvtx.range("downsample/SP_gather"):
+                x = self.spatial_context.gather_latitude(x, self.global_input_height)
+
+        with nvtx.range("downsample/pool"):
+            x = self.padding(x)
+            x = self.pool(x)
+
+        if self.spatial_context is not None and self.spatial_context.enabled:
+            if x.shape[-2] != self.global_output_height:
+                raise RuntimeError(
+                    f"Downsample produced {x.shape[-2]} latitude rows, expected "
+                    f"{self.global_output_height}"
+                )
+            x = self.spatial_context.slice_latitude(
+                x, self.global_output_height, dim=-2
+            )
+        return x
 
 
 class CLinear(nn.Module):
@@ -80,6 +111,7 @@ class CLinear(nn.Module):
         mesh_size: tuple,
         kernel_size: int = 1,
         bias: bool = True,
+        **kwargs,
     ):
         super().__init__()
         self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=1, bias=bias)
@@ -98,10 +130,12 @@ class SepConv(nn.Module):
         mesh_size: tuple,
         kernel_size: int = 3,
         bias: bool = True,
+        spatial_context=None,
+        **kwargs,
     ):
         super().__init__()
         self.padding = (kernel_size - 1) // 2
-        self.geo_padding = GeoCyclicPadding(self.padding)
+        self.geo_padding = GeoCyclicPadding(self.padding, spatial_context=spatial_context, global_height=mesh_size[0])
 
         self.depthwise = nn.Conv2d(
             input_dim, input_dim, kernel_size, groups=input_dim, bias=False
@@ -117,7 +151,7 @@ class SepConv(nn.Module):
 class ChannelNorm(nn.Module):
     """Channel normalization layer."""
 
-    def __init__(self, input_dim: int, output_dim: int):
+    def __init__(self, input_dim: int, output_dim: int, **kwargs):
         super().__init__()
         assert input_dim == output_dim
         self.eps = 1e-5
@@ -199,6 +233,8 @@ class GlobalBias(nn.Module):
         kernel_size: int = 0,  # Not used
         mesh_size: Tuple[int, int],  # required
         rank: int = 128,  # K - rank of the factorization
+        spatial_context=None,
+        **kwargs,
     ):
         super().__init__()
 
@@ -206,6 +242,7 @@ class GlobalBias(nn.Module):
         self.output_dim = output_dim
         self.rank = rank
         self.height, self.width = mesh_size
+        self.spatial_context = spatial_context
 
         # Factor matrices
         self.A = nn.Parameter(torch.zeros(input_dim, rank), requires_grad=True)
@@ -225,7 +262,15 @@ class GlobalBias(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # bias_maps: [C_in, H, W]
-        bias_maps = torch.einsum("ck,kh,kw->chw", self.A, self.U, self.V)
+        U = self.U
+        if self.spatial_context is not None and self.spatial_context.enabled:
+            local_h = self.spatial_context.local_height(self.height)
+            if x.shape[-2] == local_h:
+                start, end = self.spatial_context.lat_range(self.height)
+                U = U[:, start:end]
+            elif x.shape[-2] != self.height:
+                raise ValueError(f"GlobalBias expected {self.height} or {local_h} latitude rows; got {x.shape[-2]}")
+        bias_maps = torch.einsum("ck,kh,kw->chw", self.A, U, self.V)
 
         if self.projection is not None:
             # [C_out, H, W]
@@ -264,6 +309,7 @@ class GMBlock(nn.Sequential):
         activation: Union[Sequence, bool] = False,
         pre_normalize: bool = False,
         noise_dim: int = 0,
+        spatial_context=None,
     ):
         num_layers = len(layers)
         if num_layers == 0:
@@ -329,6 +375,7 @@ class GMBlock(nn.Sequential):
                 output_dim=layer_out_size,
                 mesh_size=mesh_size,
                 kernel_size=kernel_size[idx],
+                spatial_context=spatial_context,
             )
 
             blocks.append((layer_name, layer_obj))
@@ -341,6 +388,7 @@ class GMBlock(nn.Sequential):
                             input_dim=bias_channels,
                             output_dim=layer_out_size,
                             mesh_size=mesh_size,
+                            spatial_context=spatial_context,
                         ),
                     )
                 )

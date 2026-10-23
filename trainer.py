@@ -208,13 +208,31 @@ class LitParadis(L.LightningModule):
             var_name = re.sub(r"_h\d+$", "", feature)
 
             if var_name in cfg.training.variable_loss_weights.atmospheric:
+
+                base_weight = cfg.training.variable_loss_weights.atmospheric[var_name]
+
+                # Extract pressure level, e.g. temperature_h500 -> 500 hPa
+                match = re.search(r"_h(\d+)$", feature)
+
+                if match is None:
+                    raise ValueError(
+                        f"Cannot extract pressure level from feature '{feature}'"
+                    )
+
+                pressure_hpa = float(match.group(1))
+
+                # Vertical pressure-level weighting
+                vertical_weight = max(pressure_hpa / 1000.0, 0.2)
+
                 var_loss_weights_reordered[i] = (
-                    cfg.training.variable_loss_weights.atmospheric[var_name]
+                    base_weight * vertical_weight
                 )
+
             elif var_name in cfg.training.variable_loss_weights.surface:
                 var_loss_weights_reordered[i] = (
                     cfg.training.variable_loss_weights.surface[var_name]
                 )
+
             else:
                 raise ValueError(
                     f"No loss weight configured for output feature '{feature}' "
